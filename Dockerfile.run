@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1-labs 
+# use tabularbench as root
+FROM python:3.8-buster
+
+RUN pip install tabularbench
+RUN pip install notebook
+RUN pip install ipywidgets
+RUN pip install gower
+RUN pip install seaborn
+RUN pip install scikit-optimize
+RUN wget -O- https://aka.ms/install-vscode-server/setup.sh | sh
+COPY ./LAMDA-TALENT/ ./LAMDA-TALENT/
+RUN pip install ./LAMDA-TALENT/
+RUN pip install xgboost
+RUN pip install wandb
+RUN wandb login --relogin 6ef4d4a363d1fa1fe106a6d9c34af35a3c3eac12
+COPY --exclude=./src/results/ ./src/ /workspace/src/
+
+ENTRYPOINT python ../workspace/src/training_pipeline.py -v xgb -a baseline -d url -o random -log
+ 
+

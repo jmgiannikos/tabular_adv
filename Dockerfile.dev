@@ -1,0 +1,16 @@
+# use tabularbench as root
+FROM python:3.8-buster
+
+RUN pip install tabularbench
+RUN pip install notebook
+RUN pip install ipywidgets
+RUN pip install gower
+RUN pip install seaborn
+RUN pip install scikit-optimize
+RUN wget -O- https://aka.ms/install-vscode-server/setup.sh | sh
+ADD ./LAMDA-TALENT/ ./LAMDA-TALENT/
+RUN pip install ./LAMDA-TALENT/
+RUN pip install xgboost
+RUN pip install wandb
+
+CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]

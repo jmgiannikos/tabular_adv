@@ -155,4 +155,17 @@ dmypy.json
 cython_debug/
 
 # tabularbench
-/tabularbench
+tabularbench/
+
+# results
+wandb/
+.vscode/
+data/
+src/.vscode/
+src/.ipynb_checkpoints/
+src/results/
+src/data/
+src/__pycache__/
+
+
+/LAMDA-TALENT
