@@ -18,17 +18,19 @@ import subprocess
 import os
 import datetime
 import pickle
-import time
+import cProfile
 
 class opt_types(Enum):
     GPMIN = "Gaussian Process (Minimize)"
     RANDOM = "Random sampling"
     GRID = "Grid Search"
+    FIXED = "no hyperparameter optimization"
 
 # I admit this translation of str to enum is dumb, but whatever
 AVAILABLE_OPT_STRATS = {
     "random": opt_types.RANDOM,
     "gpmin": opt_types.GPMIN,
+    "fix": opt_types.FIXED,
     #"grid": opt_types.GRID
 }
 
@@ -53,7 +55,7 @@ DEFAULT_CONFIG = {
 # TODO: may have to introduce special handelling to translate dataframe to numpy array (or even tensor, if we are too cpu constrained?) -> seems to run fine currently. May have to revisit when using real models
 
 # pipeline doing crossval for an adversarial against a victim on a dataset
-def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparameters, tune_cls, cls_epochs, cls_batch_size, wandb_log=False):
+def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparameters, tune_cls, cls_epochs, cls_batch_size, profile, wandb_log=False):
     attacker_cls = adv_model.AVAILABLE_ATTACKERS[attacker_cls]
     victim_cls = cls_model.AVAILABLE_VICTIMS[victim_cls]
     opt_strat = AVAILABLE_OPT_STRATS[opt_strat]
@@ -77,13 +79,13 @@ def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparame
         x_adv = x.to_numpy()[test_index]
         y_adv = y[test_index]
 
-        timestamp = time.time()
         victim_scores, victim = victim_training_pipeline(x_victim, y_victim, x_adv, y_adv, victim_cls, tune_cls, wandb_log, epochs=cls_epochs, cls_batch_size=cls_batch_size)
-        print(f"victim train time {(time.time() - timestamp)/60}")
-        
-        timestamp = time.time()
-        adversarial_scores, adversarial = adversarial_training_pipeline(x_adv, y_adv, attacker_cls, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log)
-        print(f"adv train time {(time.time() - timestamp)/60}")
+        if profile is not None:
+            profile.dump_stats(DEFAULTS["results_path"]+DEFAULTS["performance_log_file"])
+
+        adversarial_scores, adversarial = adversarial_training_pipeline(x_adv, y_adv, attacker_cls, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, profile)
+        if profile is not None:
+            profile.dump_stats(DEFAULTS["results_path"]+DEFAULTS["performance_log_file"])
 
         result_dict[f"fold {fold_idx}"] = {
             "victim_scores": victim_scores,
@@ -160,10 +162,10 @@ def wandb_log_scatter(results_dict, hyperparameter_resolver, estimators, fix_con
                 table = wandb.Table(data=rows, columns=["imperceptability", "success rate"])
             wandb.log({plot_name: wandb.plot.scatter(table, "imperceptability", "success rate", title=plot_name)})
         
-def adversarial_training_pipeline(x, y, adv_class, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log):
+def adversarial_training_pipeline(x, y, adv_class, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, profile):
     x, y = select_non_target_labels(x,y)
     search_dimensions = adv_class.SEARCH_DIMS()
-    optimization_wrapper = HyperparamOptimizerWrapper(adv_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat) 
+    optimization_wrapper = HyperparamOptimizerWrapper(adv_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, profile) 
     crossval_scorer = scorer("outer_crossval_scorer", wandb_log)
     scores = cross_validate(optimization_wrapper, x, y, scoring=crossval_scorer.score, error_score="raise", return_estimator=eval_hyperparameters, return_indices=eval_hyperparameters)
     
@@ -276,6 +278,15 @@ class scorer():
 def grid_search(objective, search_dimensions, n_calls):
     pass
 
+def fixed_hyperparam(objective, default_params):
+    score = objective()
+    hyperparameters = default_params
+
+    optresult = OptimizeResult() 
+
+    optresult.update([{"x": hyperparameters, "fun": score, "x_iters": np.array([hyperparameters]), "func_vals": np.array([score])}])
+    return optresult
+
 def random_search(objective, search_dimensions, n_calls):
     generator = np.random.default_rng()
     for idx, feature in enumerate(search_dimensions):
@@ -308,7 +319,7 @@ def objective_wrapper(np_args, objective):
     return objective(*args)
 
 class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
-    def __init__(self, model_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, tolerance=DEFAULTS["tolerance"]): #TODO: passing around the whole dataset like this is cumbersome, instead just pass ranges and feature types
+    def __init__(self, model_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, tolerance=DEFAULTS["tolerance"], profile=None): #TODO: passing around the whole dataset like this is cumbersome, instead just pass ranges and feature types
         self.model_class = model_class # model should be a class and have a static method that marks it as trainable or non-trainable called trainable
         self.search_dimensions = search_dimensions # see skopt.gp_minimize for the specifics
         self.best_params = None 
@@ -322,12 +333,13 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
         self.hyperparam_result_dict = None
         if model_class.TRAINABLE():
             self.fitted_model = None
+        self.profile = None
 
     def attack(self, X):
         if self.model_class.TRAINABLE():
             attacker_model = self.fitted_model
         else:
-            attacker_model = self.model_class(self.victim, self.constraints, self.metadata,*self.best_params)
+            attacker_model = self.model_class(self.victim, self.constraints, self.metadata, *self.best_params, profile)
         adv_samples = attacker_model.attack(X)
         return adv_samples
 
@@ -343,26 +355,28 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
 
         if self.opt_strat == opt_types.GRID:
                 pass
+        elif self.fixed == opt_types.FIXED:
+            result_dict = fixed_hyperparam(objective, self.model_class.DEFAULTS["parameters"])
         elif self.opt_strat == opt_types.RANDOM:
             result_dict = random_search(objective, self.search_dimensions, n_calls=ncalls)
         elif self.opt_strat == opt_types.GPMIN:
             result_dict = sko.gp_minimize(objective, self.search_dimensions, n_calls=ncalls)
 
         if self.model_class.TRAINABLE():
-            self.fitted_model = self.model_class(self.victim, self.constraints, self.metadata, *result_dict.x).fit(X)
+            self.fitted_model = self.model_class(self.victim, self.constraints, self.metadata, *result_dict.x, profile).fit(X)
         
         self.hyperparam_result_dict = result_dict # store result dict for later analysis
         self.best_params = [result_dict.x] # this is wrapped in a list, because of the weird parameter shape the optimization function uses internally. This allows consistency between the modes
         return self
         
     def trainable_objective(self, *args):
-        model = self.model_class(self.victim, self.constraints, self.metadata, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
+        model = self.model_class(self.victim, self.constraints, self.metadata, *args, profile) #args (hyperparameters) that the model takes need to align with the search dimensions
         scores = cross_validate(model, self.X, self.y, scoring=self.objective)
         score = np.mean(scores["test_score"])
         return score
 
     def static_objective(self, *args):
-        model = self.model_class(self.victim, self.constraints, self.metadata, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
+        model = self.model_class(self.victim, self.constraints, self.metadata, *args, profile) #args (hyperparameters) that the model takes need to align with the search dimensions
         score = self.objective(model, self.X, self.y)
         return score
 
@@ -394,7 +408,7 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
         selected_y = y[bool_sample_viability_map] # assumes y to be one dimensional 
         return selected_adv_samples, selected_x, selected_y
 
-def main():
+def main(profile= None):
     parser = argparse.ArgumentParser()
     parser.add_argument("-victim_cls", "-v", type=str, choices=cls_model.AVAILABLE_VICTIMS.keys(), default=None)
     parser.add_argument("-attacker_cls", "-a", type=str, choices=adv_model.AVAILABLE_ATTACKERS.keys(), default=None)
@@ -451,11 +465,13 @@ def main():
             config=log_config
         )
 
-    results = pipeline(**config)
-    
-    results_path = "./results"
+    results_path = DEFAULTS["results_path"]
     if not os.path.exists(results_path):
         os.mkdir(results_path)
+
+    config["profile"] = profile
+
+    results = pipeline(**config)
     
     current_time = datetime.datetime.now()
     run_results_path = f"/[run]{current_time.year}-{current_time.month}-{current_time.day}_{current_time.hour}:{current_time.minute}:{current_time.second}/"
@@ -466,11 +482,16 @@ def main():
 
     with open(results_path+run_results_path+'results.pkl', 'wb+') as f:
         pickle.dump(results, f)
+    
+    profile.dump_stats(results_path)
 
         
 
 if __name__ == "__main__":
-    main()
+    profile = cProfile.Profile()
+    profile.enable()
+    main(profile)
+    profile.disable()
     
         
 
