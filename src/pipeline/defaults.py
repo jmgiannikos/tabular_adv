@@ -7,5 +7,6 @@ DEFAULTS = {
     "safe_div_factor": 0.00000001,
     "victim_training_epochs": 1,
     "performance_log_file": "perf_log",
-    "results_path": "./results"
+    "results_path": "./results",
+    "check_constraints": False
 }

@@ -98,6 +98,13 @@ class XGB(Cls_model):
             dtest = xgb.DMatrix(x)
             ypred = self.model.predict(dtest, training=False)
         return ypred
+    
+    def predict_proba(self, x):
+        if len(x.shape) == 1:
+            x = np.expand_dims(x, 0)
+        if isinstance(self.model, xgb.XGBClassifier):
+            ypob = self.model.predict_proba(x)
+        return ypob
 
 AVAILABLE_VICTIMS = {
     "random": Random_Guesser,

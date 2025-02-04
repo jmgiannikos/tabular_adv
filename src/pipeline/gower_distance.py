@@ -101,6 +101,10 @@ class Gower_dist:
         if not self.dynamic:
             divisor = self.expand_to(x,self.num_ranges)
         else:
+            if len(x.shape) < 2:
+                x = torch.unsqueeze(x, dim=0)
+            if len(y.shape) < 2:
+                y = torch.unsqueeze(y, dim=0)
             x_tensor = np.append(self.x_num, x, axis=0) #collect all seen data points
             x_tensor = torch.from_numpy(np.append(x_tensor, y, axis=0))
             divisor = self.get_ranges(x_tensor, safe_div_factor=self.safe_div_factor) 

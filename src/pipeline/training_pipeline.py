@@ -48,20 +48,24 @@ DEFAULT_CONFIG = {
     "victim_cls": "random",
     "opt_strat": "random",
     "cls_epochs": 1,
-    "cls_batch_size": -1
+    "cls_batch_size": -1,
+    "dataset_cap": None
 }
 
 # TODO: Handling of mutable and non mutable features -> seems like constraint checker already checks mutability constraints
 # TODO: may have to introduce special handelling to translate dataframe to numpy array (or even tensor, if we are too cpu constrained?) -> seems to run fine currently. May have to revisit when using real models
 
 # pipeline doing crossval for an adversarial against a victim on a dataset
-def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparameters, tune_cls, cls_epochs, cls_batch_size, profile, wandb_log=False):
+def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparameters, tune_cls, cls_epochs, cls_batch_size, profile, check_constraints, wandb_log=False, dataset_cap=None):
     attacker_cls = adv_model.AVAILABLE_ATTACKERS[attacker_cls]
     victim_cls = cls_model.AVAILABLE_VICTIMS[victim_cls]
     opt_strat = AVAILABLE_OPT_STRATS[opt_strat]
 
     dataset = dataset_factory.get_dataset(dataset_name)
     x, y = dataset.get_x_y()
+    if dataset_cap is not None and dataset_cap < x.shape[0]:
+        x = x[:dataset_cap]
+        y = y[:dataset_cap]
 
     metadata = dataset.get_metadata(only_x=True)
     distance_metric = Gower_dist(x=x, metadata=metadata) # TODO: may want to make this adjustable?
@@ -83,7 +87,7 @@ def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparame
         if profile is not None:
             profile.dump_stats(DEFAULTS["results_path"]+DEFAULTS["performance_log_file"])
 
-        adversarial_scores, adversarial = adversarial_training_pipeline(x_adv, y_adv, attacker_cls, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, profile)
+        adversarial_scores, adversarial = adversarial_training_pipeline(x_adv, y_adv, attacker_cls, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, check_constraints=check_constraints)
         if profile is not None:
             profile.dump_stats(DEFAULTS["results_path"]+DEFAULTS["performance_log_file"])
 
@@ -98,11 +102,11 @@ def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparame
 
 # NOTE: in current state doing this for trainable adv_cls is very costly, since we retrain the adv model from the ground. This is because we throw the previously trained models away!
 # TODO: make more efficient for trainable adv_cls. Will require touching up the entire pipeline
-def evaluate_hyperparams(adv_cls, victim, X, y, estimators, splits, constraints, metadata):
+def evaluate_hyperparams(adv_cls, victim, X, y, estimators, splits, constraints, metadata, check_constraints=True, distance_metric=None):
     results = {}
     hyperparam_resolver = {}
 
-    for fold_idx in range(splits["train"].shape[0]):
+    for fold_idx in range(len(splits["train"])):
         results[f"fold_{fold_idx}"] = {}
         hyperparam_resolver[f"fold_{fold_idx}"] = {}
 
@@ -114,6 +118,8 @@ def evaluate_hyperparams(adv_cls, victim, X, y, estimators, splits, constraints,
 
         # extract results on train set from estimator and create hyperparam resolver
         results[f"fold_{fold_idx}"]["train"] = {}
+        results[f"fold_{fold_idx}"]["test"] = {}
+        
         for hyperparam_idx in range(estimator.hyperparam_result_dict["x_iters"].shape[0]):
             hyperparam_resolver[f"fold_{fold_idx}"][hyperparam_idx] = estimator.hyperparam_result_dict["x_iters"][hyperparam_idx]
 
@@ -124,16 +130,21 @@ def evaluate_hyperparams(adv_cls, victim, X, y, estimators, splits, constraints,
                 adv.fit(X_train, y_train)
 
             # evaluate on test set
+            if check_constraints:
+                scorer_obj = scorer(wandb_log=False, constraints=constraints, distance_metric=distance_metric)
+            else:
+                scorer_obj = scorer(wandb_log=False, distance_metric=distance_metric)
 
-            hyperparam_result_test = scorer(adv, X_test, y_test, wandb_log=False) # logging for these scores will be done manually
-            hyperparam_result_train = scorer(adv, X_train, y_train, wandb_log=False) # logging for these scores will be done manually
+            hyperparam_result_test = scorer_obj.score(adv, X_test, y_test) # logging for these scores will be done manually
+
+            hyperparam_result_train = scorer_obj.score(adv, X_train, y_train) # logging for these scores will be done manually
 
             results[f"fold_{fold_idx}"]["train"][hyperparam_idx] = hyperparam_result_train
             results[f"fold_{fold_idx}"]["test"][hyperparam_idx] = hyperparam_result_test
 
     return results, hyperparam_resolver
 
-def wandb_log_scatter(results_dict, hyperparameter_resolver, estimators, fix_constraints_log=False):
+def wandb_log_scatter(results_dict, hyperparameter_resolver, estimators=None, fix_constraints_log=False):
     for fold_name in results_dict.keys():
         val_dicts = {
             "test": results_dict[fold_name]["test"],
@@ -149,11 +160,16 @@ def wandb_log_scatter(results_dict, hyperparameter_resolver, estimators, fix_con
                 row.append(hyperparam_results["success rate"])
                 if fix_constraints_log:
                     estimator = estimators[int(fold_name.split("_")[-1])]
-                    hyperparam_names = estimator.HYPERPARAM_NAMES()
-                    if "constraint_correction" in hyperparam_names:
-                        fix_constraints_idx = hyperparam_names.index("constraint_correction")
-                        constraint_fixing_val = hyperparameter_resolver[fold_name][hyperparam_idx][fix_constraints_idx]
-                        row.append(constraint_fixing_val)
+                    if isinstance(estimator, HyperparamOptimizerWrapper):
+                        estimator = estimator.model_class
+
+                    if isinstance(estimator, adv_model.Adv_model) or issubclass(estimator, adv_model.Adv_model):
+                        hyperparam_names = estimator.HYPERPARAM_NAMES()
+                        if "constraint_correction" in hyperparam_names:
+                            fix_constraints_idx = hyperparam_names.index("constraint_correction")
+                            constraint_fixing_val = hyperparameter_resolver[fold_name][hyperparam_idx][fix_constraints_idx]
+                            row.append(constraint_fixing_val)
+
                 rows.append(row)
             
             if fix_constraints_log:
@@ -162,18 +178,17 @@ def wandb_log_scatter(results_dict, hyperparameter_resolver, estimators, fix_con
                 table = wandb.Table(data=rows, columns=["imperceptability", "success rate"])
             wandb.log({plot_name: wandb.plot.scatter(table, "imperceptability", "success rate", title=plot_name)})
         
-def adversarial_training_pipeline(x, y, adv_class, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, profile):
+def adversarial_training_pipeline(x, y, adv_class, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, check_constraints):
     x, y = select_non_target_labels(x,y)
     search_dimensions = adv_class.SEARCH_DIMS()
-    optimization_wrapper = HyperparamOptimizerWrapper(adv_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, profile) 
+    optimization_wrapper = HyperparamOptimizerWrapper(adv_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, check_constraints=check_constraints) 
     crossval_scorer = scorer("outer_crossval_scorer", wandb_log)
     scores = cross_validate(optimization_wrapper, x, y, scoring=crossval_scorer.score, error_score="raise", return_estimator=eval_hyperparameters, return_indices=eval_hyperparameters)
-    
-    if eval_hyperparameters:
-        hyperparam_results, hyperparam_resolver = evaluate_hyperparams(adv_class, victim, x, y, scores["estimator"], scores["indices"], constraints, metadata)
-        if wandb_log:
 
-            wandb_log_scatter(hyperparam_results, hyperparam_resolver)
+    if eval_hyperparameters:
+        hyperparam_results, hyperparam_resolver = evaluate_hyperparams(adv_class, victim, x, y, scores["estimator"], scores["indices"], constraints, metadata, check_constraints=check_constraints, distance_metric=distance_metric)
+        if wandb_log:
+            wandb_log_scatter(hyperparam_results, hyperparam_resolver, scores["estimator"], fix_constraints_log=True)
         scores["hyperparam_results"] = hyperparam_results
         scores["hyperparam_resolver"] = hyperparam_resolver
 
@@ -233,23 +248,56 @@ def select_non_target_labels(x,y,target_label=DEFAULTS["target_label"]):
 
 # NOTE: this is kinda unclean, since we read a lot of dataset properties from the attacker wrapper, which is unintuitive. Should however be clean technically.
 class scorer():
-    def __init__(self, name="", wandb_log=False):
+    DEFAULTS = {
+        "tolerance": 0
+    }
+    def __init__(self, name="", wandb_log=False, constraints=None, distance_metric=None):
         self.name=name
         self.call_counter = 0
         self.wandb_log = wandb_log
         self.logged_tables = {}
+        self.constraints=constraints
+        self.distance_metric = distance_metric
         
     def score(self, attacker, X, y): #takes an initialized model and gives it a score. Must be compatible with sklearns crossvalidate
         adv_samples = attacker.attack(X)
-        pruned_adv_samples, pruned_X, pruned_y = attacker.prune_constraint_violations(adv_samples, X, y)
+        if isinstance(attacker, HyperparamOptimizerWrapper):
+            pruned_adv_samples, pruned_X, pruned_y = attacker.prune_constraint_violations(adv_samples, X, y)
+        elif self.constraints is not None:
+            if isinstance(adv_samples, torch.Tensor):
+                adv_samples = adv_samples.numpy(True)
+            if isinstance(X,  torch.Tensor):
+                X = X.numpy(True)
+            constraints_checker = ConstraintChecker(self.constraints, tolerance=self.DEFAULTS["tolerance"])
+            sample_viability_map = constraints_checker.check_constraints(X, adv_samples) # True for every sample that breaches no constraints
+            bool_sample_viability_map = sample_viability_map == 1
+            pruned_adv_samples = adv_samples[bool_sample_viability_map] #assumes shape nxm where n is number of samples and m is number of features per sample
+            pruned_X = X[bool_sample_viability_map] #assumes shape nxm where n is number of samples and m is number of features per sample
+            pruned_y = y[bool_sample_viability_map] # assumes y to be one dimensional 
+        else:
+            pruned_adv_samples = adv_samples
+            pruned_X = X
+            pruned_y = y
+        
         num_constraint_violations = np.shape(y)[0] - np.shape(pruned_y)[0] # value mostly irrellevant currently
+        constraint_violation_ratio = num_constraint_violations / np.shape(y)[0]
         victim_predictions = attacker.victim.predict(pruned_adv_samples) # assumes predict produces binary labels
-        flipped_labels = pruned_y == victim_predictions
+        flipped_labels = pruned_y != victim_predictions
         success_rate = np.sum(flipped_labels.astype(int))/np.shape(y)[0] # assumes 0 is the main index of y. Samples that violate constraints are not counted, even if the label flips
-        imperceptability = attacker.get_imperceptability(pruned_adv_samples, pruned_X)
+        if isinstance(attacker, HyperparamOptimizerWrapper):
+            imperceptability = -attacker.get_imperceptability(pruned_adv_samples, pruned_X) # NOTE: negated because imperceptability is negated gower
+        elif self.distance_metric is not None:
+            gower_distances = self.distance_metric.dist_func(adv_samples, X, pairwise=True)
+            # calculate mean distance to original sample in absence of a better idea 
+            if gower_distances.shape[0] != 0:
+                imperceptability = torch.sum(gower_distances).item()/gower_distances.shape[0]
+            else:
+                imperceptability = 0
+        else:
+            imperceptability = np.nan
 
         if self.wandb_log:
-            self.log_bar_chart(f"{self.name}: constraint violations", self.call_counter, num_constraint_violations)
+            self.log_bar_chart(f"{self.name}: constraint violations", self.call_counter, constraint_violation_ratio)
             self.log_bar_chart(f"{self.name}: success rate", self.call_counter, success_rate)
             self.log_bar_chart(f"{self.name}: imperceptability", self.call_counter, imperceptability)
 
@@ -282,9 +330,7 @@ def fixed_hyperparam(objective, default_params):
     score = objective()
     hyperparameters = default_params
 
-    optresult = OptimizeResult() 
-
-    optresult.update([{"x": hyperparameters, "fun": score, "x_iters": np.array([hyperparameters]), "func_vals": np.array([score])}])
+    optresult = OptimizeResult({"x": hyperparameters, "fun": score, "x_iters": np.array([hyperparameters]), "func_vals": np.array([score])}) 
     return optresult
 
 def random_search(objective, search_dimensions, n_calls):
@@ -319,7 +365,7 @@ def objective_wrapper(np_args, objective):
     return objective(*args)
 
 class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
-    def __init__(self, model_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, tolerance=DEFAULTS["tolerance"], profile=None): #TODO: passing around the whole dataset like this is cumbersome, instead just pass ranges and feature types
+    def __init__(self, model_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, check_constraints, tolerance=DEFAULTS["tolerance"]): #TODO: passing around the whole dataset like this is cumbersome, instead just pass ranges and feature types
         self.model_class = model_class # model should be a class and have a static method that marks it as trainable or non-trainable called trainable
         self.search_dimensions = search_dimensions # see skopt.gp_minimize for the specifics
         self.best_params = None 
@@ -333,13 +379,13 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
         self.hyperparam_result_dict = None
         if model_class.TRAINABLE():
             self.fitted_model = None
-        self.profile = None
+        self.check_constraints = check_constraints
 
     def attack(self, X):
         if self.model_class.TRAINABLE():
             attacker_model = self.fitted_model
         else:
-            attacker_model = self.model_class(self.victim, self.constraints, self.metadata, *self.best_params, profile)
+            attacker_model = self.model_class(self.victim, self.constraints, self.metadata, *self.best_params)
         adv_samples = attacker_model.attack(X)
         return adv_samples
 
@@ -355,7 +401,7 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
 
         if self.opt_strat == opt_types.GRID:
                 pass
-        elif self.fixed == opt_types.FIXED:
+        elif self.opt_strat == opt_types.FIXED:
             result_dict = fixed_hyperparam(objective, self.model_class.DEFAULTS["parameters"])
         elif self.opt_strat == opt_types.RANDOM:
             result_dict = random_search(objective, self.search_dimensions, n_calls=ncalls)
@@ -363,20 +409,20 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
             result_dict = sko.gp_minimize(objective, self.search_dimensions, n_calls=ncalls)
 
         if self.model_class.TRAINABLE():
-            self.fitted_model = self.model_class(self.victim, self.constraints, self.metadata, *result_dict.x, profile).fit(X)
+            self.fitted_model = self.model_class(self.victim, self.constraints, self.metadata, *result_dict.x).fit(X, y)
         
         self.hyperparam_result_dict = result_dict # store result dict for later analysis
         self.best_params = [result_dict.x] # this is wrapped in a list, because of the weird parameter shape the optimization function uses internally. This allows consistency between the modes
         return self
         
     def trainable_objective(self, *args):
-        model = self.model_class(self.victim, self.constraints, self.metadata, *args, profile) #args (hyperparameters) that the model takes need to align with the search dimensions
+        model = self.model_class(self.victim, self.constraints, self.metadata, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
         scores = cross_validate(model, self.X, self.y, scoring=self.objective)
         score = np.mean(scores["test_score"])
         return score
 
     def static_objective(self, *args):
-        model = self.model_class(self.victim, self.constraints, self.metadata, *args, profile) #args (hyperparameters) that the model takes need to align with the search dimensions
+        model = self.model_class(self.victim, self.constraints, self.metadata, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
         score = self.objective(model, self.X, self.y)
         return score
 
@@ -401,12 +447,19 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
         return -mean_dist # return negative mean dist, so minimizing gower distance has a positive effect
 
     def prune_constraint_violations(self, adv_samples, X, y):
-        sample_viability_map = self.constraints_checker.check_constraints(X.to_numpy(), adv_samples.to_numpy()) # True for every sample that breaches no constraints
-        bool_sample_viability_map = sample_viability_map == 1
-        selected_adv_samples = adv_samples[bool_sample_viability_map] #assumes shape nxm where n is number of samples and m is number of features per sample
-        selected_x = X[bool_sample_viability_map] #assumes shape nxm where n is number of samples and m is number of features per sample
-        selected_y = y[bool_sample_viability_map] # assumes y to be one dimensional 
-        return selected_adv_samples, selected_x, selected_y
+        if isinstance(adv_samples, torch.Tensor):
+            adv_samples = adv_samples.numpy(True)
+        if isinstance(X,  torch.Tensor):
+            X = X.numpy(True)
+        if self.check_constraints:
+            sample_viability_map = self.constraints_checker.check_constraints(X, adv_samples) # True for every sample that breaches no constraints
+            bool_sample_viability_map = sample_viability_map == 1
+            selected_adv_samples = adv_samples[bool_sample_viability_map] #assumes shape nxm where n is number of samples and m is number of features per sample
+            selected_x = X[bool_sample_viability_map] #assumes shape nxm where n is number of samples and m is number of features per sample
+            selected_y = y[bool_sample_viability_map] # assumes y to be one dimensional 
+            return selected_adv_samples, selected_x, selected_y
+        else:
+            return adv_samples, X, y
 
 def main(profile= None):
     parser = argparse.ArgumentParser()
@@ -420,6 +473,8 @@ def main(profile= None):
     parser.add_argument("-wandb_log", "-log", action="store_true")
     parser.add_argument("-cls_batch_size", "-clsb", type=int, default=-1)
     parser.add_argument("-eval_hyper", "-evalh", action="store_true")
+    parser.add_argument("-dataset_cap", "-dcap", type=int, default=None)
+    parser.add_argument("-check_constraints", "-con", action="store_true")
     args = parser.parse_args()
     
     if args.config is not None:
@@ -440,6 +495,7 @@ def main(profile= None):
     config["tune_cls"] = args.tune_cls
     config["wandb_log"] = args.wandb_log
     config["eval_hyperparameters"] = args.eval_hyper
+    config["check_constraints"] = args.check_constraints
 
     current_git_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD']).decode('ascii').strip()
     log_config = {
@@ -483,7 +539,7 @@ def main(profile= None):
     with open(results_path+run_results_path+'results.pkl', 'wb+') as f:
         pickle.dump(results, f)
     
-    profile.dump_stats(results_path)
+    #profile.dump_stats(results_path + run_results_path + "time_profile") # currently useless, since only main thread is profiled. Most work happens in side threads
 
         
 
