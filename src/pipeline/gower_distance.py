@@ -95,16 +95,17 @@ class Gower_dist:
         return source
     
     def get_num_dists(self, x, y, pairwise):
+        if len(x.shape) < 2:
+            x = torch.unsqueeze(x, dim=0)
+        if len(y.shape) < 2:
+            y = torch.unsqueeze(y, dim=0)
+            
         if not pairwise:
             x, y = self.expand_tensors(x, y)
 
         if not self.dynamic:
             divisor = self.expand_to(x,self.num_ranges)
         else:
-            if len(x.shape) < 2:
-                x = torch.unsqueeze(x, dim=0)
-            if len(y.shape) < 2:
-                y = torch.unsqueeze(y, dim=0)
             x_tensor = np.append(self.x_num, x, axis=0) #collect all seen data points
             x_tensor = torch.from_numpy(np.append(x_tensor, y, axis=0))
             divisor = self.get_ranges(x_tensor, safe_div_factor=self.safe_div_factor) 
@@ -119,6 +120,26 @@ class Gower_dist:
         eq_tensor = torch.eq(x,y)
         dist = eq_tensor.type(x.dtype)
         return dist
+
+    def get_feature_wise_distances(self, x, y):
+        if len(self.cat_idxs) != 0:
+            x_num, x_cat = self.split_num_and_cat(x, self.num_idxs, self.cat_idxs)
+            y_num, y_cat = self.split_num_and_cat(y, self.num_idxs, self.cat_idxs)
+
+            assert x_num.shape == y_num.shape
+            assert y_cat.shape == x_cat.shape
+
+            dists_num = self.get_num_dists(x_num, y_num, True)
+            dists_cat = self.get_cat_dists(x_cat, y_cat, True)
+    
+            dists = torch.cat([dists_num, dists_cat], dim=2)
+        else:
+            dists = self.get_num_dists(x, y, True)
+        
+        weights = self.expand_to(dists, self.weighting_tensor)
+
+        weighted_dists = torch.mul(dists, weights)
+        return weighted_dists
 
     def dist_func(self, y, x, pairwise=False):
         if len(self.cat_idxs) != 0:
@@ -139,13 +160,19 @@ class Gower_dist:
             if x is None:
                 x_num = self.x_num
             else:
-                if not isinstance(x, np.ndarray):
-                    x = x.to_numpy()
-                x_num = torch.from_numpy(x)
+                if not isinstance(x, torch.Tensor):
+                    if not isinstance(x, np.ndarray):
+                        x = x.to_numpy()
+                    x_num = torch.from_numpy(x)
+                else:
+                    x_num = x
             
-            if not isinstance(y, np.ndarray):
-                y = y.to_numpy()
-            y_num = torch.from_numpy(y).to(self.cuda_device)
+            if not isinstance(y, torch.Tensor):
+                if not isinstance(y, np.ndarray):
+                    y = y.to_numpy()
+                y_num = torch.from_numpy(y).to(self.cuda_device)
+            else:
+                y_num = y
             
             if pairwise:
                 assert x_num.shape == y_num.shape

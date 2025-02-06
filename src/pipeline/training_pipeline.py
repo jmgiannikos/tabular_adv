@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
 # TODO: may have to introduce special handelling to translate dataframe to numpy array (or even tensor, if we are too cpu constrained?) -> seems to run fine currently. May have to revisit when using real models
 
 # pipeline doing crossval for an adversarial against a victim on a dataset
-def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparameters, tune_cls, cls_epochs, cls_batch_size, profile, check_constraints, wandb_log=False, dataset_cap=None):
+def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparameters, tune_cls, cls_epochs, cls_batch_size, profile, check_constraints, wandb_log=False, dataset_cap=None, log_avg_feat_distance=False):
     attacker_cls = adv_model.AVAILABLE_ATTACKERS[attacker_cls]
     victim_cls = cls_model.AVAILABLE_VICTIMS[victim_cls]
     opt_strat = AVAILABLE_OPT_STRATS[opt_strat]
@@ -87,7 +87,8 @@ def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparame
         if profile is not None:
             profile.dump_stats(DEFAULTS["results_path"]+DEFAULTS["performance_log_file"])
 
-        adversarial_scores, adversarial = adversarial_training_pipeline(x_adv, y_adv, attacker_cls, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, check_constraints=check_constraints)
+        x_adv, y_adv = select_non_target_labels(x_adv,y_adv)
+        adversarial_scores, adversarial = adversarial_training_pipeline(x_adv, y_adv, attacker_cls, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, check_constraints=check_constraints, log_avg_feat_distance=log_avg_feat_distance)
         if profile is not None:
             profile.dump_stats(DEFAULTS["results_path"]+DEFAULTS["performance_log_file"])
 
@@ -95,7 +96,8 @@ def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparame
             "victim_scores": victim_scores,
             "victim": victim,
             "adversarial_scores": adversarial_scores,
-            "adversarial": adversarial
+            "adversarial": adversarial,
+            "adv_set_size": y_adv.shape[0]
         }
 
     return result_dict
@@ -178,13 +180,15 @@ def wandb_log_scatter(results_dict, hyperparameter_resolver, estimators=None, fi
                 table = wandb.Table(data=rows, columns=["imperceptability", "success rate"])
             wandb.log({plot_name: wandb.plot.scatter(table, "imperceptability", "success rate", title=plot_name)})
         
-def adversarial_training_pipeline(x, y, adv_class, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, check_constraints):
-    x, y = select_non_target_labels(x,y)
+def adversarial_training_pipeline(x, y, adv_class, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, check_constraints, log_avg_feat_distance=False):
     search_dimensions = adv_class.SEARCH_DIMS()
-    optimization_wrapper = HyperparamOptimizerWrapper(adv_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, check_constraints=check_constraints) 
+    optimization_wrapper = HyperparamOptimizerWrapper(adv_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, check_constraints=check_constraints, log_avg_feat_distance=log_avg_feat_distance) 
     crossval_scorer = scorer("outer_crossval_scorer", wandb_log)
-    scores = cross_validate(optimization_wrapper, x, y, scoring=crossval_scorer.score, error_score="raise", return_estimator=eval_hyperparameters, return_indices=eval_hyperparameters)
-
+    scores = cross_validate(optimization_wrapper, x, y, scoring=crossval_scorer.score, error_score="raise", return_estimator=eval_hyperparameters, return_indices=eval_hyperparameters, cv=DEFAULTS["crossval_folds"])
+    if log_avg_feat_distance:
+        crossval_scorer.log_feature_analysis()    
+    if wandb_log:
+        crossval_scorer.log_bar_chart()
     if eval_hyperparameters:
         hyperparam_results, hyperparam_resolver = evaluate_hyperparams(adv_class, victim, x, y, scores["estimator"], scores["indices"], constraints, metadata, check_constraints=check_constraints, distance_metric=distance_metric)
         if wandb_log:
@@ -251,16 +255,26 @@ class scorer():
     DEFAULTS = {
         "tolerance": 0
     }
-    def __init__(self, name="", wandb_log=False, constraints=None, distance_metric=None):
+    def __init__(self, name="", wandb_log=False, constraints=None, distance_metric=None, log_avg_feat_distance=False, feature_names=None):
         self.name=name
         self.call_counter = 0
         self.wandb_log = wandb_log
         self.logged_tables = {}
         self.constraints=constraints
         self.distance_metric = distance_metric
+        self.log_avg_feat_distance = log_avg_feat_distance
+        self.feature_wise_distances = []
+        self.feature_names = feature_names
         
     def score(self, attacker, X, y): #takes an initialized model and gives it a score. Must be compatible with sklearns crossvalidate
-        adv_samples = attacker.attack(X)
+        adv_samples = attacker.attack(X)   
+
+        if self.log_avg_feat_distance:
+            if isinstance(attacker, HyperparamOptimizerWrapper):
+                self.feature_wise_distances.append(attacker.distance_metric.get_feature_wise_distances(X, adv_samples))
+            elif self.distance_metric is not None:
+                self.feature_wise_distances.append(self.distance_metric.get_feature_wise_distances(X, adv_samples))
+
         if isinstance(attacker, HyperparamOptimizerWrapper):
             pruned_adv_samples, pruned_X, pruned_y = attacker.prune_constraint_violations(adv_samples, X, y)
         elif self.constraints is not None:
@@ -297,29 +311,59 @@ class scorer():
             imperceptability = np.nan
 
         if self.wandb_log:
-            self.log_bar_chart(f"{self.name}: constraint violations", self.call_counter, constraint_violation_ratio)
-            self.log_bar_chart(f"{self.name}: success rate", self.call_counter, success_rate)
-            self.log_bar_chart(f"{self.name}: imperceptability", self.call_counter, imperceptability)
-
+            self.update_tables(f"{self.name}: constraint violations", self.call_counter, constraint_violation_ratio)
+            self.update_tables(f"{self.name}: success rate", self.call_counter, success_rate)
+            self.update_tables(f"{self.name}: imperceptability", self.call_counter, imperceptability)
+        self.call_counter += 1
         return {"constraint violations": num_constraint_violations,
                 "success rate": success_rate,
                 "imperceptability": imperceptability}
     
-    def log_bar_chart(self, chart_name, fold, value):
+    def update_tables(self, chart_name, fold, value):
         fold_name = F"fold_{fold}"
         if chart_name in self.logged_tables.keys():
             table = self.logged_tables[chart_name]
             table.add_data(fold_name, value)
         else:
             table = wandb.Table(columns=["fold", "value"], data=[[fold_name, value]])
+            self.logged_tables[chart_name] = table
+    
+    def log_bar_chart(self):
+        for chart_name in self.logged_tables.keys():
+            wandb.log(
+                {
+                    chart_name: wandb.plot.bar(
+                        self.logged_tables[chart_name], "fold", "value", title=chart_name
+                    )
+                }
+            )
+        
+    def log_feature_analysis(self):
+        tensor_elements = []
+        for element in self.feature_wise_distances: # NOTE: this may be redundant, but better safe than sorry (?)
+            if not isinstance(element, torch.Tensor):
+                element = torch.Tensor(element)
+            if len(element.shape()) < 2:
+                element = torch.unsqueeze(element, dim=0)
+            tensor_elements.append(element)
 
-        wandb.log(
-            {
-                chart_name: wandb.plot.bar(
-                    table, "fold", "value", title=chart_name
-                )
-            }
-        )
+        feat_dist_tensor = torch.stack(tensor_elements, dim=0)
+        feat_adjusted_tensor = torch.logical_not(torch.eq(feat_dist_tensor, 0)).long()
+
+        adjusted_feature_counts = torch.sum(feat_adjusted_tensor, dim=0)
+        avg_adjusted_tensor = torch.mean(feat_dist_tensor, dim=0)
+
+        if self.feature_names is None:
+            columns = range(adjusted_feature_counts.shape[1])
+        else:
+            columns = self.feature_names
+
+        adjusted_feature_counts_table = wandb.Table(columns=columns, data=adjusted_feature_counts)
+        avg_adjusted_tensor_table = wandb.Table(columns=columns, data=avg_adjusted_tensor)
+
+        wandb.log({"adjusted_features": wandb.plot.bar(adjusted_feature_counts_table, "feature", "count", title="adjusted_features")})
+        wandb.log({"feature_adjustments": wandb.plot.bar(avg_adjusted_tensor_table, "feature", "avg_dist", title="feature_adjustments")})
+
         
 
 # TODO: maybe implement this? Is more complicated than it seems (especially efficiently) if we wanna do exactly n evenly spaced calls
@@ -417,7 +461,7 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
         
     def trainable_objective(self, *args):
         model = self.model_class(self.victim, self.constraints, self.metadata, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
-        scores = cross_validate(model, self.X, self.y, scoring=self.objective)
+        scores = cross_validate(model, self.X, self.y, scoring=self.objective, cv=DEFAULTS["crossval_folds"])
         score = np.mean(scores["test_score"])
         return score
 
@@ -475,6 +519,7 @@ def main(profile= None):
     parser.add_argument("-eval_hyper", "-evalh", action="store_true")
     parser.add_argument("-dataset_cap", "-dcap", type=int, default=None)
     parser.add_argument("-check_constraints", "-con", action="store_true")
+    parser.add_argument("-log_avg_feat_distance", "-fa", action="store_true")
     args = parser.parse_args()
     
     if args.config is not None:
@@ -496,6 +541,7 @@ def main(profile= None):
     config["wandb_log"] = args.wandb_log
     config["eval_hyperparameters"] = args.eval_hyper
     config["check_constraints"] = args.check_constraints
+    config["log_avg_feat_distance"] = args.log_avg_feat_distance
 
     current_git_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD']).decode('ascii').strip()
     log_config = {

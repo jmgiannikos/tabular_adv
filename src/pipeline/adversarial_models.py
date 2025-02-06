@@ -15,7 +15,7 @@ from defaults import DEFAULTS as global_defaults
 import wandb
 import torch
 import os
-from pipeline.bounded_prio_queue import Bounded_Priority_Queue
+from bounded_prio_queue import Bounded_Priority_Queue
 import utils
 
 class Adv_model(ABC):
@@ -72,21 +72,22 @@ class Dummy_adv(Adv_model):
 
 class Baseline_adv(Adv_model, sk.base.BaseEstimator):
     DEFAULTS = {
-        "target": -150, # negative means this managed to flip the value (we negate for min heap purposes)
-        "max_iter": 100, # maximum number of search steps before we abort and just take the best value seen so far
+        "target": -400, # negative means this managed to flip the value (we negate for min heap purposes)
+        "max_iter": 10, # maximum number of search steps before we abort and just take the best value seen so far
         "parameters": [False, 10, 50, 10],
         "eps_exp": -8,
-        "expand_type": "gridstep",
+        "expand_type": "fixgrid",
         "record_search_num": 2,
         "precision": 3,
         "accel_attack": True,
-        "batch_size": 1000
+        "batch_size": 1000,
     }
 
-    def __init__(self, victim, constraints, metadata, constraint_correction=DEFAULTS["parameters"][0], queue_size=DEFAULTS["parameters"][1], total_step_num=DEFAULTS["parameters"][2], max_expand_nodes=DEFAULTS["parameters"][3]):
+    def __init__(self, victim, constraints, metadata, constraint_correction=DEFAULTS["parameters"][0], queue_size=DEFAULTS["parameters"][1], total_step_num=DEFAULTS["parameters"][2], max_expand_nodes=DEFAULTS["parameters"][3], expand_type=DEFAULTS["expand_type"]):
         hyperparams = [constraint_correction, queue_size, total_step_num]
         super().__init__(victim, constraints, metadata, *hyperparams)
         self.features = metadata["feature"].tolist()
+        self.expand_type = expand_type
         self.mutable_feature_choices = {}
         self.step_sizes = {}
         self.feature_idxs = {}
@@ -121,7 +122,7 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
 
     @staticmethod
     def HYPERPARAM_NAMES(): #names are in order
-        return ["constraint_correction", "queue_size", "total_step_num"]
+        return ["constraint_correction","queue_size", "total_step_num", "max_expand_nodes"]
 
     @staticmethod
     def TRAINABLE():
@@ -129,10 +130,10 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
     
     @staticmethod
     def SEARCH_DIMS():
-        return [[True, False], (1,100), (2,1000)] # NOTE: these are still chosen arbitrarily. May be subject to adjustment
+        return [(True, False), (1,100), (2,1000), (3,10000)] # NOTE: these are still chosen arbitrarily. May be subject to adjustment
 
     def fit(self, x, y): #training here just means storing the seen ranges in x so we can define reasonable step sizes. We also restrict ourselves to remain in distribution -> reasonable restriction???
-        self.distance_metric = Gower_dist(x, self.metadata, dynamic=True) #set these to be dynamic so we dont have exploding gower distances
+        self.distance_metric = Gower_dist(x, self.metadata, dynamic=False) #set these to be dynamic so we dont have exploding gower distances
         for feature in self.mutable_feature_choices.keys():
             feature_idx = self.feature_idxs[feature]
             feature_vals = x[:,feature_idx]
@@ -171,36 +172,50 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         return significant_decimals
 
     def get_perturbation_tensor(self, x):
-        num_features = x.shape[1]
-        self.feature_category_to_num_map = {}
-        self.feature_category_modulus = {}
-        for iter, feature in enumerate(self.feature_idxs.keys()):
-            feature_idx = self.feature_idxs[feature] # already only mutable features 
-            if self.feature_types[feature] == "int":
-                border = int(self.step_sizes[feature]*self.max_expand_nodes/2)
-                start = -border
-                end = border
-                deltas = np.arange(start=start, stop=end, step=self.step_sizes[feature], dtype=int)
-            elif self.feature_types[feature] == "real":
-                border = self.step_sizes[feature]*self.max_expand_nodes/2
-                start = -border
-                end = border
-                deltas = np.linspace(start=start, stop=end, num=self.max_expand_nodes)    
-            elif self.feature_types[feature] == "cat":
-                self.feature_category_to_num_map[feature] = {}
-                for num_val, category in enumerate(self.mutable_feature_choices[feature]):
-                    self.feature_category_to_num_map[feature][category] = num_val
-                self.feature_category_modulus[feature] = len(self.mutable_feature_choices[feature])
-                
-                deltas = np.arange(start=1,stop=self.feature_category_modulus[feature], step=1)
+        if self.expand_type == "fixgrid":
+            index_list = []
+            perturbation_list = []
+            for feature in self.feature_idxs.keys():
+                feature_idx = self.feature_idxs[feature]
+                for choice in self.mutable_feature_choices[feature]:
+                    if self.feature_types[feature] == "real":
+                        choice = round(choice, self.significant_decimals[feature])
+                    index_list.append(feature_idx)
+                    perturbation_list.append(choice)
+            self.index_tensor = torch.unsqueeze(torch.LongTensor([index_list]), dim=2)
+            perturbation_tensor = torch.unsqueeze(torch.DoubleTensor([perturbation_list]), dim=2)
+            return perturbation_tensor
+        else:
+            num_features = x.shape[1]
+            self.feature_category_to_num_map = {}
+            self.feature_category_modulus = {}
+            for iter, feature in enumerate(self.feature_idxs.keys()):
+                feature_idx = self.feature_idxs[feature] # already only mutable features 
+                if self.feature_types[feature] == "int":
+                    border = int(self.step_sizes[feature]*self.max_expand_nodes/2)
+                    start = -border
+                    end = border
+                    deltas = np.arange(start=start, stop=end, step=self.step_sizes[feature], dtype=int)
+                elif self.feature_types[feature] == "real":
+                    border = self.step_sizes[feature]*self.max_expand_nodes/2
+                    start = -border
+                    end = border
+                    deltas = np.linspace(start=start, stop=end, num=self.max_expand_nodes)    
+                elif self.feature_types[feature] == "cat":
+                    self.feature_category_to_num_map[feature] = {}
+                    for num_val, category in enumerate(self.mutable_feature_choices[feature]):
+                        self.feature_category_to_num_map[feature][category] = num_val
+                    self.feature_category_modulus[feature] = len(self.mutable_feature_choices[feature])
+                    
+                    deltas = np.arange(start=1,stop=self.feature_category_modulus[feature], step=1)
 
-            new_chunk = np.zeros((len(deltas), num_features))
-            new_chunk[:,feature_idx] = deltas
-            if iter == 0:
-                perturbations = new_chunk
-            else:
-                perturbations = np.append(perturbations, new_chunk, axis=0)
-        perturbation_tensor = torch.from_numpy(perturbations)
+                new_chunk = np.zeros((len(deltas), num_features))
+                new_chunk[:,feature_idx] = deltas
+                if iter == 0:
+                    perturbations = new_chunk
+                else:
+                    perturbations = np.append(perturbations, new_chunk, axis=0)
+            perturbation_tensor = torch.from_numpy(perturbations)
         return perturbation_tensor
 
     def attack(self, x):
@@ -216,19 +231,17 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
                 x = x[num_record_search:]
                 base_proba = base_proba[num_record_search:]
                 adv_sample_batch = self.accel_adv_best_first_search(record_pre_batch_x, record_pre_batch_probas, self.victim, collect_metrics=True)
-                adv_samples.append(adv_sample_batch)
+                adv_samples.extend(adv_sample_batch)
+
             while batch_idx < batch_num:
                 min_idx = batch_idx*self.DEFAULTS["batch_size"]
                 max_idx = batch_idx+1*self.DEFAULTS["batch_size"]
-                if batch_idx < batch_num-1:
-                    batch_x = x[min_idx:max_idx]
-                    batch_base_proba = base_proba[min_idx:max_idx]
-                else:
-                    batch_x = x[min_idx:]
-                    batch_base_proba = base_proba[min_idx:]
+                batch_x = x[min_idx:max_idx]
+                batch_base_proba = base_proba[min_idx:max_idx]
                 adv_sample_batch = self.accel_adv_best_first_search(batch_x, batch_base_proba, self.victim, collect_metrics=False)
-                adv_samples.append(adv_sample_batch)
-            return torch.cat(adv_samples, dim=0).numpy(force=True)
+                adv_samples.extend(adv_sample_batch)
+                batch_idx += 1
+            return torch.stack(list(map(lambda x: x[1], adv_samples)), dim=0).numpy()
         else:
             adv_samples = None
             for sample_idx in range(x.shape[0]):
@@ -240,7 +253,8 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
                     adv_samples = np.append(adv_samples, adv_sample, 0)
             return adv_samples
     
-    def accel_adv_best_first_search(self, startnodes, base_probas, victim, expand_type=DEFAULTS["expand_type"], collect_metrics=False):
+    # TODO: translate from and to cat values (needed for other datasets)
+    def accel_adv_best_first_search(self, startnodes, base_probas, victim, collect_metrics=False):
         if isinstance(startnodes, np.ndarray):
             startnodes = torch.from_numpy(startnodes)
         elif isinstance(startnodes, torch.Tensor):
@@ -249,7 +263,10 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
             startnodes = torch.Tensor(startnodes)
 
         startnodes = self.round_reals(startnodes)
-        start_node_evals = self.accel_eval_func(startnodes, startnodes, base_probas, victim)
+        idx_map = {}
+        for idx in range(startnodes.shape[0]):
+            idx_map[idx] = (idx, idx+1)
+        start_node_evals = self.accel_eval_func(startnodes, startnodes, base_probas, victim, idx_map)
 
         open_nodes = {}
         closed_nodes = []
@@ -265,9 +282,9 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         while len(open_nodes.keys()) > 0 and current_iter < self.max_iterations:
             current_nodes = []
             for idx, node_queue in [(key, open_nodes[key]) for key in open_nodes.keys()]:
-                node_eval_result ,current_node = node_queue.pop()
+                node_eval_result, current_node = node_queue.pop()
                 if collect_metrics:
-                    self.collect_metrics(victim, idx, node_eval_result, current_iter, idx, startnodes[idx])
+                    self.collect_metrics(victim=victim, search_idx=idx, node_eval_result=node_eval_result, current_iter=current_iter, current_node=current_node, start=startnodes[idx])
 
                 if node_eval_result <= self.target: # we are trying to maximize the goal function here
                     best_nodes[idx] = (node_eval_result, current_node)
@@ -276,13 +293,20 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
                     if node_eval_result < best_nodes[idx][0]:
                         best_nodes[idx] = (node_eval_result, current_node)
                     current_nodes.append(current_node)
+                    assert not any(list(map(lambda node: torch.equal(node, current_node), closed_nodes[idx])))
                     closed_nodes[idx].append(current_node)
+
+            if len(open_nodes.keys()) <= 0: #this may occur if all explored nodes were found to be satisfactory. In that case we abort search immediately
+                break
             current_nodes = torch.stack(current_nodes, dim=0)
 
-            if expand_type == "gridstep":
+            if self.expand_type == "gridstep":
                 expanded_nodes = self.accel_gridstep_node_expand(current_nodes)
+            elif self.expand_type == "fixgrid":
+                expanded_nodes = self.accel_fixgrid_node_expand(current_nodes)
+
             expanded_nodes, idx_map = self.accel_check_visited(expanded_nodes, open_nodes, closed_nodes)
-            eval_results = self.accel_eval_func(expanded_nodes, startnodes, base_probas, victim)
+            eval_results = self.accel_eval_func(expanded_nodes, startnodes, base_probas, victim, idx_map)
 
             for idx_mapping_key in idx_map.keys(): #TODO: may want to do this with map function? Could be faster.
                 idx_mapping = idx_map[idx_mapping_key]
@@ -295,7 +319,7 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
             for key in open_nodes.keys(): # abort condition: Queue empty
                 if open_nodes[key].is_empty():
                     open_nodes.pop[key] 
-
+            current_iter += 1
         return best_nodes
 
     def round_reals(self, samples):
@@ -320,15 +344,15 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         expanded_start_nodes = torch.stack(expanded_start_nodes, dim=0)
         expanded_start_probas = torch.Tensor(expanded_start_probas)
 
-        victim_proba_prediction = victim.predict_proba(perturbations)[:,global_defaults["target_label"]]
+        victim_proba_prediction = torch.from_numpy(victim.predict_proba(perturbations)[:,global_defaults["target_label"]])
 
         proba_change = torch.subtract(victim_proba_prediction, expanded_start_probas)
 
         distances = self.distance_metric.dist_func(expanded_start_nodes, perturbations, pairwise=True)
         safe_div_floor = torch.Tensor([10**float(self.DEFAULTS["eps_exp"])]).expand(distances.shape[0])
-        safe_div_dist = torch.max(torch.stack([distances, safe_div_floor], dim=1), dim=1, keepdim=False)
+        safe_div_dist, _ = torch.max(torch.stack([distances, safe_div_floor], dim=1), dim=1, keepdim=False)
         metrics = torch.divide(proba_change, safe_div_dist)
-        return metrics*(-1) # negate for overall consistency (minimize cost)
+        return torch.neg(metrics) # negate for overall consistency (minimize cost)
 
     def accel_gridstep_node_expand(self, nodes):
         nodes_shape = nodes.shape
@@ -343,14 +367,27 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         expanded_nodes = self.round_reals(expanded_nodes)
         expanded_nodes = self.modulo_cats(expanded_nodes)
         return expanded_nodes
+    
+    def accel_fixgrid_node_expand(self, nodes):
+        desired_shape = (nodes.shape[0], self.perturbation_tensor.shape[1], nodes.shape[1])
+        nodes = torch.unsqueeze(nodes, dim=1)
+        nodes = nodes.expand(desired_shape)
+        perturbations = self.perturbation_tensor.expand(desired_shape)
+        feature_indices = self.index_tensor.expand(desired_shape)
+        nodes = torch.scatter(input=nodes, dim=2, index=feature_indices, src=perturbations)
+        nodes = torch.flatten(nodes, start_dim=0, end_dim=1)
+        return nodes
 
     def accel_check_visited(self, expanded_nodes, open_nodes, closed_nodes):# NOTE: must return idx mapping that maps areas of the return tensor to the key of the open nodes dictionary!
-        chunk_size = self.perturbation_tensor.shape[0]
+        if self.expand_type == "gridstep":
+            chunk_size = self.perturbation_tensor.shape[0]
+        elif self.expand_type == "fixgrid":
+            chunk_size = self.perturbation_tensor.shape[1]
         running_idx = 0
         idx_mapping = {}
         chunks = []
-        for local_idx, map_idx in enumerate(self.open_nodes.keys()):
-            chunk = expanded_nodes[chunk_size*local_idx:(chunk_size+1)*local_idx]
+        for local_idx, map_idx in enumerate(open_nodes.keys()):
+            chunk = expanded_nodes[chunk_size*local_idx:chunk_size*(local_idx+1)]
             open_node_queue = open_nodes[map_idx]
             chunk = chunk[open_node_queue.is_not_in(chunk)]
             chunk = chunk[utils.is_not_in(chunk, closed_nodes[map_idx])]
@@ -364,7 +401,7 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         classifier_id = hex(id(self))[2:].upper()
         expanded_start_proba = victim.predict_proba(current_node)[:,global_defaults["target_label"]]
         victim_proba_prediction = victim.predict_proba(start)[:,global_defaults["target_label"]]
-        proba_change = np.subtract(victim_proba_prediction, expanded_start_proba)
+        proba_change = np.subtract(expanded_start_proba, victim_proba_prediction)
         prob_diff = proba_change
         gower_dist = self.distance_metric.dist_func(start, current_node, pairwise=True)
         running_loss = 0
@@ -381,7 +418,7 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
             }
         )
 
-    def adv_best_first_search(self, start, base_proba, victim, expand_type=DEFAULTS["expand_type"], collect_metrics=False, search_idx=0):
+    def adv_best_first_search(self, start, base_proba, victim, collect_metrics=False, search_idx=0):
         open_nodes = [(self.node_eval_function(start, start, base_proba, victim).item(), 0, start)] # the attached value of the start node should always be 0, but you never know...
         hq.heapify(open_nodes)
         closed_nodes = []
@@ -401,7 +438,7 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
             if node_eval_result < best_node[0]:
                 best_node = (node_eval_result, current_node)
             
-            if expand_type == "fixgrid":
+            if self.expand_type == "fixgrid":
                 perturbations = self.generate_next_nodes_fixgrid(current_node)
             else:
                 perturbations = self.generate_next_nodes_gridstep(current_node)
