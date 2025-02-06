@@ -13,6 +13,7 @@ COPY ./LAMDA-TALENT/ ./LAMDA-TALENT/
 RUN pip install ./LAMDA-TALENT/
 RUN pip install xgboost
 RUN pip install wandb
+pip install more-itertools
 RUN wandb login --relogin 6ef4d4a363d1fa1fe106a6d9c34af35a3c3eac12
 COPY --exclude=./src/results/ ./src/ /workspace/src/
 

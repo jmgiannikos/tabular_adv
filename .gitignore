@@ -166,6 +166,8 @@ src/.ipynb_checkpoints/
 src/results/
 src/data/
 src/__pycache__/
+*.pkl
+*results*
 
 
 /LAMDA-TALENT
