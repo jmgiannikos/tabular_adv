@@ -1,6 +1,8 @@
 import torch
 
 def is_not_in(samples, check_against_samples):
+    if len(check_against_samples) == 0:
+        return torch.BoolTensor([True]*samples.shape[0])
     check_against_samples = torch.stack(check_against_samples, dim=0)
     desired_shape = (samples.shape[0], check_against_samples.shape[0], samples.shape[1])
     check_against_samples = torch.unsqueeze(check_against_samples, dim=0).expand(desired_shape)

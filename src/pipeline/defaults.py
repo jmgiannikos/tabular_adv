@@ -8,5 +8,6 @@ DEFAULTS = {
     "victim_training_epochs": 1,
     "performance_log_file": "perf_log",
     "results_path": "./results",
-    "check_constraints": False
+    "check_constraints": False,
+    "crossval_folds": 3
 }
