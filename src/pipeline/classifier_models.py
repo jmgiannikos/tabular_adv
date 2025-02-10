@@ -4,6 +4,7 @@ from sklearn.model_selection import KFold
 from sklearn.model_selection import cross_validate
 import xgboost as xgb
 import skopt as sko
+import tabpfn
 
 # probably not going to need this, since we want to use fully implemented models (preferrably already pre-trained, but that may be a bit too optimistic). May serve as a wrapper
 class Cls_model(ABC):
@@ -105,8 +106,68 @@ class XGB(Cls_model):
         if isinstance(self.model, xgb.XGBClassifier):
             ypob = self.model.predict_proba(x)
         return ypob
+    
+class TabPFN(Cls_model):
+    DEFAULTS = {
+        "ncalls": 10
+    }
+    def __init__(self, tune_model=False):
+        super().__init__(tune_model)
+        self.parameter_list = []
+        self.search_dimensions = []
+        self.best_parameters = None
+        self.tune_model = tune_model
+
+    def fit(self, x, y, hyperparameters=None):
+        if not self.tune_model:
+            model = tabpfn.TabPFNClassifier()
+            self.model = model.fit(x,y)
+        else:
+            if hyperparameters is None:
+                if self.best_parameters is None:
+                    raise ValueError("hyperparameters not initialized")
+                else:
+                    hyperparameters = self.best_parameters
+            
+            model = tabpfn.TabPFNClassifier(*hyperparameters)
+            self.model = model.fit(x,y)
+        return self
+    
+    def predict(self, x):
+        if len(x.shape) == 1:
+            x = np.expand_dims(x, 0)
+        ypred = self.model.predict(x)
+        return ypred
+    
+    def predict_proba(self, x):
+        if len(x.shape) == 1:
+            x = np.expand_dims(x, 0)
+        ypob = self.model.predict_proba(x)
+        return ypob
+    
+    def tune_hyperparameters(self, x, y, ncalls=DEFAULTS["ncalls"]):
+        self.x = x
+        self.y = y 
+        result_dict = sko.gp_minimize(self.objective, self.search_dimensions, n_calls=ncalls)
+        self.best_parameters = [result_dict.x]
+        self.fit(x,y)
+        return self
+    
+    def objective(self, *args):
+        parameters = {}
+        parameters = self.dictify_params(*args)
+        model = tabpfn.TabPFNClassifier(**parameters)
+        scores = cross_validate(model, self.x, self.y, scoring="f1")
+        score = np.mean(scores["test_score"])
+        return score
+
+    def dictify_params(self, *parameters):
+        for i, parameter_name in enumerate(self.parameter_list): # had to use native python for loop. sadge :(
+            parameters[parameter_name] = parameters[i]
+        return parameters
 
 AVAILABLE_VICTIMS = {
     "random": Random_Guesser,
-    "xgb": XGB
+    "xgb": XGB,
+    "tabpfn": TabPFN
 }

@@ -122,6 +122,11 @@ class Gower_dist:
         return dist
 
     def get_feature_wise_distances(self, x, y):
+        if not isinstance(x, torch.Tensor):
+            x = torch.Tensor(x)
+        if not isinstance(y, torch.Tensor):
+            y = torch.Tensor(y)
+            
         if len(self.cat_idxs) != 0:
             x_num, x_cat = self.split_num_and_cat(x, self.num_idxs, self.cat_idxs)
             y_num, y_cat = self.split_num_and_cat(y, self.num_idxs, self.cat_idxs)

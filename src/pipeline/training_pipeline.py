@@ -122,7 +122,7 @@ def evaluate_hyperparams(adv_cls, victim, X, y, estimators, splits, constraints,
         results[f"fold_{fold_idx}"]["train"] = {}
         results[f"fold_{fold_idx}"]["test"] = {}
         
-        for hyperparam_idx in range(estimator.hyperparam_result_dict["x_iters"].shape[0]):
+        for hyperparam_idx in range(len(estimator.hyperparam_result_dict["x_iters"])):
             hyperparam_resolver[f"fold_{fold_idx}"][hyperparam_idx] = estimator.hyperparam_result_dict["x_iters"][hyperparam_idx]
 
         for hyperparam_idx in hyperparam_resolver[f"fold_{fold_idx}"].keys():
@@ -182,8 +182,8 @@ def wandb_log_scatter(results_dict, hyperparameter_resolver, estimators=None, fi
         
 def adversarial_training_pipeline(x, y, adv_class, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, wandb_log, check_constraints, log_avg_feat_distance=False):
     search_dimensions = adv_class.SEARCH_DIMS()
-    optimization_wrapper = HyperparamOptimizerWrapper(adv_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, check_constraints=check_constraints, log_avg_feat_distance=log_avg_feat_distance) 
-    crossval_scorer = scorer("outer_crossval_scorer", wandb_log)
+    optimization_wrapper = HyperparamOptimizerWrapper(adv_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, check_constraints=check_constraints) 
+    crossval_scorer = scorer("outer_crossval_scorer", wandb_log, log_avg_feat_distance=log_avg_feat_distance, feature_names=metadata["feature"].tolist())
     scores = cross_validate(optimization_wrapper, x, y, scoring=crossval_scorer.score, error_score="raise", return_estimator=eval_hyperparameters, return_indices=eval_hyperparameters, cv=DEFAULTS["crossval_folds"])
     if log_avg_feat_distance:
         crossval_scorer.log_feature_analysis()    
@@ -296,7 +296,8 @@ class scorer():
         num_constraint_violations = np.shape(y)[0] - np.shape(pruned_y)[0] # value mostly irrellevant currently
         constraint_violation_ratio = num_constraint_violations / np.shape(y)[0]
         victim_predictions = attacker.victim.predict(pruned_adv_samples) # assumes predict produces binary labels
-        flipped_labels = pruned_y != victim_predictions
+        victim_original_predictions = attacker.victim.predict(pruned_X) # get predictions of the model on the original samples #NOTE: it may be reasonable to prune the data so this only contains samples that the model predicts as 0 (correctly)
+        flipped_labels = victim_original_predictions != victim_predictions
         success_rate = np.sum(flipped_labels.astype(int))/np.shape(y)[0] # assumes 0 is the main index of y. Samples that violate constraints are not counted, even if the label flips
         if isinstance(attacker, HyperparamOptimizerWrapper):
             imperceptability = -attacker.get_imperceptability(pruned_adv_samples, pruned_X) # NOTE: negated because imperceptability is negated gower
@@ -343,23 +344,26 @@ class scorer():
         for element in self.feature_wise_distances: # NOTE: this may be redundant, but better safe than sorry (?)
             if not isinstance(element, torch.Tensor):
                 element = torch.Tensor(element)
-            if len(element.shape()) < 2:
+            if len(element.shape) < 2:
                 element = torch.unsqueeze(element, dim=0)
             tensor_elements.append(element)
 
-        feat_dist_tensor = torch.stack(tensor_elements, dim=0)
+        feat_dist_tensor = torch.cat(tensor_elements, dim=0)
         feat_adjusted_tensor = torch.logical_not(torch.eq(feat_dist_tensor, 0)).long()
 
         adjusted_feature_counts = torch.sum(feat_adjusted_tensor, dim=0)
         avg_adjusted_tensor = torch.mean(feat_dist_tensor, dim=0)
 
         if self.feature_names is None:
-            columns = range(adjusted_feature_counts.shape[1])
+            feat_names = range(adjusted_feature_counts.shape[1])
         else:
-            columns = self.feature_names
+            feat_names = self.feature_names
 
-        adjusted_feature_counts_table = wandb.Table(columns=columns, data=adjusted_feature_counts)
-        avg_adjusted_tensor_table = wandb.Table(columns=columns, data=avg_adjusted_tensor)
+        adjusted_feature_counts_table_values = [[feat_names[idx], adjusted_feature_counts[idx]] for idx in range(len(feat_names))]
+        adjusted_feature_avgs_table_values = [[feat_names[idx], avg_adjusted_tensor[idx]] for idx in range(len(feat_names))]
+
+        adjusted_feature_counts_table = wandb.Table(columns=["feature", "count"], data=adjusted_feature_counts_table_values)
+        avg_adjusted_tensor_table = wandb.Table(columns=["feature", "avg_dist"], data=adjusted_feature_avgs_table_values)
 
         wandb.log({"adjusted_features": wandb.plot.bar(adjusted_feature_counts_table, "feature", "count", title="adjusted_features")})
         wandb.log({"feature_adjustments": wandb.plot.bar(avg_adjusted_tensor_table, "feature", "avg_dist", title="feature_adjustments")})
@@ -371,7 +375,7 @@ def grid_search(objective, search_dimensions, n_calls):
     pass
 
 def fixed_hyperparam(objective, default_params):
-    score = objective()
+    score = objective(default_params)
     hyperparameters = default_params
 
     optresult = OptimizeResult({"x": hyperparameters, "fun": score, "x_iters": np.array([hyperparameters]), "func_vals": np.array([score])}) 
@@ -398,14 +402,14 @@ def random_search(objective, search_dimensions, n_calls):
     best_score = np.min(objective_scores)
     best_params = parameter_mat[np.argmin(objective_scores)]
 
-    optresult = OptimizeResult() 
+    optresult = OptimizeResult({"x": best_params, "fun": best_score, "x_iters": parameter_mat, "func_vals": objective_scores}) 
 
-    optresult.update([{"x": best_params, "fun": best_score, "x_iters": parameter_mat, "func_vals": objective_scores}])
+    #optresult.update([{"x": best_params, "fun": best_score, "x_iters": parameter_mat, "func_vals": objective_scores}])
 
     return optresult
 
 def objective_wrapper(np_args, objective):
-    args = np_args.tolist()
+    args = (np_args.tolist(),)
     return objective(*args)
 
 class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
@@ -460,12 +464,15 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
         return self
         
     def trainable_objective(self, *args):
+        if len(args) == 1 and isinstance(args[0], list):
+            args = args[0]
         model = self.model_class(self.victim, self.constraints, self.metadata, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
         scores = cross_validate(model, self.X, self.y, scoring=self.objective, cv=DEFAULTS["crossval_folds"])
         score = np.mean(scores["test_score"])
         return score
 
     def static_objective(self, *args):
+        args = args[0]
         model = self.model_class(self.victim, self.constraints, self.metadata, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
         score = self.objective(model, self.X, self.y)
         return score
@@ -475,7 +482,8 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
         pruned_adv_samples, pruned_X, pruned_y = self.prune_constraint_violations(adv_samples, val_X, val_y)
         #num_constraint_violations = np.shape(val_y)[0] - np.shape(pruned_y)[0] # value mostly irrellevant currently
         victim_predictions = self.victim.predict(pruned_adv_samples) # assumes predict produces binary labels
-        flipped_labels = pruned_y == victim_predictions
+        victim_orig_predictions = self.victim.predict(pruned_X)
+        flipped_labels = victim_orig_predictions != victim_predictions
         success_rate = np.sum(flipped_labels.astype(int))/np.shape(self.y)[0] # assumes 0 is the main index of y. Samples that violate constraints are not counted, even if the label flips
         imperceptability = self.get_imperceptability(pruned_adv_samples, pruned_X)
         score = (1-imperceptability_weighting)*success_rate + (imperceptability_weighting)*imperceptability #starting with equal weight should be fine since both values are between 0 and 1

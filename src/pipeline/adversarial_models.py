@@ -72,19 +72,19 @@ class Dummy_adv(Adv_model):
 
 class Baseline_adv(Adv_model, sk.base.BaseEstimator):
     DEFAULTS = {
-        "target": -400, # negative means this managed to flip the value (we negate for min heap purposes)
-        "max_iter": 10, # maximum number of search steps before we abort and just take the best value seen so far
-        "parameters": [False, 10, 50, 10],
-        "eps_exp": -8,
-        "expand_type": "fixgrid",
-        "record_search_num": 2,
+        "target": -500, # negative means this managed to flip the value (we negate for min heap purposes)
+        "max_iter": 20, # maximum number of search steps before we abort and just take the best value seen so far
+        "parameters": [False, 10, 50, 10, -500],
+        "eps_exp": -10,
+        "expand_type": "gridstep",
+        "record_search_num": 10,
         "precision": 3,
         "accel_attack": True,
-        "batch_size": 1000,
+        "batch_size": 5000,
     }
 
-    def __init__(self, victim, constraints, metadata, constraint_correction=DEFAULTS["parameters"][0], queue_size=DEFAULTS["parameters"][1], total_step_num=DEFAULTS["parameters"][2], max_expand_nodes=DEFAULTS["parameters"][3], expand_type=DEFAULTS["expand_type"]):
-        hyperparams = [constraint_correction, queue_size, total_step_num]
+    def __init__(self, victim, constraints, metadata, constraint_correction=DEFAULTS["parameters"][0], queue_size=DEFAULTS["parameters"][1], total_step_num=DEFAULTS["parameters"][2], max_expand_nodes=DEFAULTS["parameters"][3], target=DEFAULTS["parameters"][4], expand_type=DEFAULTS["expand_type"]):
+        hyperparams = [constraint_correction, queue_size, total_step_num, max_expand_nodes, target]
         super().__init__(victim, constraints, metadata, *hyperparams)
         self.features = metadata["feature"].tolist()
         self.expand_type = expand_type
@@ -100,6 +100,7 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
                 self.feature_types[feature] = metadata.query("feature == @feature")["type"].to_list()[0]
 
         self.constraint_correction = constraint_correction
+        self.constraint_correction = False # NOTE: Temporary constraint correction disable
         self.queue_size = queue_size
         self.total_step_num = total_step_num
         self.max_expand_nodes = max_expand_nodes
@@ -117,12 +118,12 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
                 backend=self.backend,
                 feature_names=metadata["feature"].tolist()
             ))
-        self.target = self.DEFAULTS["target"]
+        self.target = target
         self.max_iterations = self.DEFAULTS["max_iter"]
 
     @staticmethod
     def HYPERPARAM_NAMES(): #names are in order
-        return ["constraint_correction","queue_size", "total_step_num", "max_expand_nodes"]
+        return ["constraint_correction", "queue_size", "total_step_num", "max_expand_nodes", "target"]
 
     @staticmethod
     def TRAINABLE():
@@ -130,7 +131,7 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
     
     @staticmethod
     def SEARCH_DIMS():
-        return [(True, False), (1,100), (2,1000), (3,10000)] # NOTE: these are still chosen arbitrarily. May be subject to adjustment
+        return [[True, False], (1,100), (2,1000), (3,50), (-600, -150)] # NOTE: these are still chosen arbitrarily. May be subject to adjustment
 
     def fit(self, x, y): #training here just means storing the seen ranges in x so we can define reasonable step sizes. We also restrict ourselves to remain in distribution -> reasonable restriction???
         self.distance_metric = Gower_dist(x, self.metadata, dynamic=False) #set these to be dynamic so we dont have exploding gower distances
@@ -284,7 +285,7 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
             for idx, node_queue in [(key, open_nodes[key]) for key in open_nodes.keys()]:
                 node_eval_result, current_node = node_queue.pop()
                 if collect_metrics:
-                    self.collect_metrics(victim=victim, search_idx=idx, node_eval_result=node_eval_result, current_iter=current_iter, current_node=current_node, start=startnodes[idx])
+                    self.collect_metrics(victim=victim, search_idx=idx, node_eval_result=node_eval_result, current_iter=current_iter, current_node=current_node, start=startnodes[idx], base_proba=base_probas[idx])
 
                 if node_eval_result <= self.target: # we are trying to maximize the goal function here
                     best_nodes[idx] = (node_eval_result, current_node)
@@ -396,12 +397,12 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
             chunks.append(chunk)
         return torch.cat(chunks, dim=0), idx_mapping
         
-
-    def collect_metrics(self, victim, search_idx, node_eval_result, current_iter, current_node, start):
+    # NOTE: some loss of fidelity seems to occur with the node_eval_result not perfectly aligning with -prob_diff/gower_dist. Currently believe tha this is due to a rounding error
+    def collect_metrics(self, victim, search_idx, node_eval_result, current_iter, current_node, start, base_proba):
         classifier_id = hex(id(self))[2:].upper()
-        expanded_start_proba = victim.predict_proba(current_node)[:,global_defaults["target_label"]]
-        victim_proba_prediction = victim.predict_proba(start)[:,global_defaults["target_label"]]
-        proba_change = np.subtract(expanded_start_proba, victim_proba_prediction)
+        # expanded_start_proba = torch.from_numpy(victim.predict_proba(start)[:,global_defaults["target_label"]])
+        victim_proba_prediction = torch.from_numpy(victim.predict_proba(current_node)[:,global_defaults["target_label"]])
+        proba_change = torch.subtract(victim_proba_prediction, base_proba)
         prob_diff = proba_change
         gower_dist = self.distance_metric.dist_func(start, current_node, pairwise=True)
         running_loss = 0

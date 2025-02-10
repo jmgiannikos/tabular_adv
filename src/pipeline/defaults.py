@@ -1,6 +1,6 @@
 DEFAULTS = {
     "target_label": 1,
-    "ncalls": 10,
+    "ncalls": 50,
     "imperceptability_weight": 0.5,
     "tolerance": 0,
     "cuda_device": "cpu",
