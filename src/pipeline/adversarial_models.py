@@ -80,8 +80,6 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         "expand_type": "gridstep",
         "record_search_num": 1,
         "precision": 3,
-        "accel_attack": True,
-        "batch_size": 5000,
     }
 
     def __init__(self, victim, constraints, metadata, log_path, log_style, constraint_correction=DEFAULTS["parameters"][0], queue_size=DEFAULTS["parameters"][1], total_step_num=DEFAULTS["parameters"][2], max_expand_nodes=DEFAULTS["parameters"][3], target=DEFAULTS["parameters"][4], expand_type=DEFAULTS["expand_type"]):
@@ -93,10 +91,10 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         self.step_sizes = {}
         self.feature_idxs = {}
         self.feature_types = {}
-        self.significant_decimals = {}
         self.log_results = {}
         self.log_path = log_path
         self.log_style = log_style
+
         for idx, feature in enumerate(self.features): # NOTE: really hope the order of the metadata feature list aligns with the order of x
             if metadata.query("feature == @feature")["mutable"].to_list()[0]:
                 self.mutable_feature_choices[feature] = None
@@ -104,7 +102,7 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
                 self.feature_types[feature] = metadata.query("feature == @feature")["type"].to_list()[0]
 
         self.constraint_correction = constraint_correction
-        self.constraint_correction = False # NOTE: Temporary constraint correction disable
+        self.constraint_correction = False # NOTE: Temporary constraint correction disable for hyperparam search
         self.queue_size = queue_size
         self.total_step_num = total_step_num
         self.max_expand_nodes = max_expand_nodes
@@ -161,11 +159,302 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
                 choices = [step_num * step_size for step_num in range(self.total_step_num)]
                 self.mutable_feature_choices[feature] = choices
                 self.step_sizes[feature] = step_size
+        return self
+
+    def store_logs(self):
+        obj_identifier = hex(id(self))[2:].upper()
+        file_path = f"{self.log_path}[{obj_identifier}]search_logs.json"
+        log_obj = json.dumps(self.log_results)
+        with open(file_path, "w") as outfile:
+            outfile.write(log_obj)
+
+    def wandb_log(self):
+        adv_id = hex(id(self))[2:].upper()
+        for result_idx in self.log_results.keys():
+            for idx in range(len(self.log_results[result_idx]["step"])):
+                wandb.log(
+                data={
+                    f"{adv_id}_search{result_idx}/prob_diff":self.log_results[result_idx]["prob_diff"],
+                    f"{adv_id}_search{result_idx}/gower_dist": self.log_results[result_idx]["gower_dist"],
+                    f"{adv_id}_search{result_idx}/constraint_loss": self.log_results[result_idx]["const_loss"],
+                    f"{adv_id}_search{result_idx}/cost_function": self.log_results[result_idx]["cost_func"],
+                    f"{adv_id}_search{result_idx}/step": self.log_results[result_idx]["step"],
+                    f"{adv_id}_search{result_idx}/total_prob": self.log_results[result_idx]["total_node_prob"]
+                }
+            )
+
+    def attack(self, x):
+        base_proba = self.victim.predict_proba(x)[:, global_defaults["target_label"]] # the base label probabilities from which we start
+        adv_samples = None
+        for sample_idx in range(x.shape[0]):
+            adv_sample = self.adv_best_first_search(x[sample_idx], base_proba[sample_idx], self.victim, collect_metrics=sample_idx<self.DEFAULTS["record_search_num"], search_idx=sample_idx) 
+            if adv_samples is None:
+                adv_samples = np.expand_dims(adv_sample, 0)
+            else:
+                adv_sample = np.expand_dims(adv_sample, 0)
+                adv_samples = np.append(adv_samples, adv_sample, 0)
+        return adv_samples
+     
+    # NOTE: some loss of fidelity seems to occur with the node_eval_result not perfectly aligning with -prob_diff/gower_dist. Currently believe tha this is due to a rounding error
+    def collect_metrics(self, victim, search_idx, node_eval_result, current_iter, current_node, start, base_proba):
+        # classifier_id = hex(id(self))[2:].upper()
+        # expanded_start_proba = torch.from_numpy(victim.predict_proba(start)[:,global_defaults["target_label"]])
+        victim_proba_prediction = torch.from_numpy(victim.predict_proba(current_node)[:,global_defaults["target_label"]])
+        proba_change = torch.subtract(victim_proba_prediction, base_proba)
+        prob_diff = proba_change
+        gower_dist = self.distance_metric.dist_func(start, current_node, pairwise=True)
+        running_loss = 0
+        for constraint_executor in self.constraint_executors:
+            running_loss += constraint_executor.execute(torch.from_numpy(np.expand_dims(current_node, axis=0))).sum()
+        const_loss = running_loss
+
+        local_log_results = {
+                "prob_diff": [prob_diff],
+                "gower_dist": [gower_dist],
+                "const_loss": [const_loss],
+                "cost_func": [node_eval_result],
+                "step": [current_iter],
+                "total_node_prob": [victim_proba_prediction]
+            }
+        self.append_to_log_dict(search_idx, current_iter, local_log_results)
+
+    def append_to_log_dict(self, search_idx, current_iter, new_results):
+        if search_idx in self.log_results.keys():
+            if current_iter not in self.log_results[search_idx]["step"]:
+                for key in self.log_results[search_idx].keys():
+                    self.log_results[search_idx][key].extend(new_results[key])
+            else:
+                search_idx = search_idx + self.DEFAULTS["batch_size"]
+                self.append_to_log_dict(search_idx, current_iter, new_results) # not as optimal because recursion, but looks elegant in code so whatever.
+        else:
+            self.log_results[search_idx] = new_results
+
+    def adv_best_first_search(self, start, base_proba, victim, collect_metrics=False, search_idx=0):
+        open_nodes = [(self.node_eval_function(start, start, base_proba, victim).item(), 0, start)] # the attached value of the start node should always be 0, but you never know...
+        hq.heapify(open_nodes)
+        closed_nodes = []
+        best_node = (open_nodes[0][0],open_nodes[0][2])
+        current_iter = 0
+        expaded_node_ctr = 1
+        while len(open_nodes) > 0 and current_iter < self.max_iterations:
+            node_eval_result, _ ,current_node = hq.heappop(open_nodes)
+
+            if collect_metrics:
+                self.collect_metrics(victim, search_idx, node_eval_result, current_iter, current_node, start)
+
+            if len(closed_nodes) == 0 or not any([np.all(np.equal(current_node, closed_node)) for closed_node in closed_nodes]): #check if this node config is already present in closed nodes
+                closed_nodes.append(current_node)
+            if node_eval_result <= self.target: # we are trying to maximize the goal function here
+                return current_node
+            if node_eval_result < best_node[0]:
+                best_node = (node_eval_result, current_node)
+            
+            if self.expand_type == "fixgrid":
+                perturbations = self.generate_next_nodes_fixgrid(current_node)
+            else:
+                perturbations = self.generate_next_nodes_gridstep(current_node)
+
+            perturbation_eval_results = self.node_eval_function(perturbations, start, base_proba, victim)
+
+            new_queue_elements = []
+            for idx in range(perturbations.shape[0]):
+                new_queue_elements.append((perturbation_eval_results[idx].item(), expaded_node_ctr, perturbations[idx]))
+                expaded_node_ctr += 1
+
+            for new_queue_element in new_queue_elements:
+                if not any([np.all(np.equal(new_queue_element[2], closed_node)) for closed_node in closed_nodes]):
+                    hq.heappush(open_nodes, new_queue_element)
+
+            if len(open_nodes) > self.queue_size:
+                open_nodes.sort()
+                open_nodes = open_nodes[0:self.queue_size] #remove the largest elements to cut queue down to size again
+
+            current_iter += 1
+        
+        return best_node[1]
+
+    def generate_next_nodes_gridstep(self, start_node):
+        if len(start_node.shape) == 1:
+            start_node = np.expand_dims(start_node, 0)
+        for idx_outer, feature in enumerate(self.mutable_feature_choices):
+            feature_idx = self.feature_idxs[feature]
+            if self.feature_types[feature] == "cat":
+                current_value = start_node[0][self.feature_idxs[feature]]
+                if current_value in self.mutable_feature_choices[feature]:
+                    possible_changes = self.mutable_feature_choices[feature].copy()
+                    possible_changes.remove(current_value)
+                else:
+                    possible_changes = self.mutable_feature_choices[feature]
+                possible_changes = np.array([possible_changes])
+            else:
+                if self.feature_types[feature] == "int":
+                    border = int(self.step_sizes[feature]*self.max_expand_nodes/2)
+                    start = -border
+                    end = border
+                    deltas = np.arange(start=start, stop=end, step=self.step_sizes[feature], dtype=int)
+                else:
+                    border = self.step_sizes[feature]*self.max_expand_nodes/2
+                    start = -border
+                    end = border
+                    deltas = np.linspace(start=start, stop=end, num=self.max_expand_nodes)
+
+                deltas = deltas[deltas != 0]
+                possible_changes = deltas + start_node[0,feature_idx] #NOTE: this assumes we only ever pass this function a single node to expand...
+                possible_changes = np.expand_dims(possible_changes, axis=0)
+
+            perturbation = np.copy(start_node)
+            perturbation = np.repeat(perturbation, possible_changes.shape[1], axis=0)
+            perturbation[:,feature_idx] = possible_changes
+
+            if idx_outer == 0:
+                perturbations = perturbation
+            else:
+                perturbations = np.append(perturbations, perturbation, axis=0)
+
+        return perturbations
+    
+    def generate_next_nodes_fixgrid(self, start_node, check_constraint_fix_success= True):
+        if check_constraint_fix_success:
+            successful_constraint_fixes = 0
+            failed_constraint_fixes = 0
+        if len(start_node.shape) == 1:
+            start_node = np.expand_dims(start_node, 0) 
+        for idx_outer, feature in enumerate(self.mutable_feature_choices):
+            current_value = start_node[0][self.feature_idxs[feature]]
+            if current_value in self.mutable_feature_choices[feature]:
+                possible_changes = self.mutable_feature_choices[feature].copy()
+                possible_changes.remove(current_value)
+            else:
+                possible_changes = self.mutable_feature_choices[feature]
+
+            for idx_inner, change in enumerate(possible_changes):
+                perturbation = np.copy(start_node)
+                perturbation[0][self.feature_idxs[feature]] = change
+
+                if self.constraint_correction: # run this locally, so we dont fix constraints unnessecarily. Dont know if that would do something.
+                    if self.constraints_checker.check_constraints(start_node, perturbation)[0] == 0: # returns False if a constraint was violated
+                        perturbation = self.constraint_fixer.fix(perturbation)
+                        if check_constraint_fix_success:
+                            if self.constraints_checker.check_constraints(start_node, perturbation)[0] == 0:
+                                # print("WARNING: Constraint fix unsusccessful")
+                                failed_constraint_fixes += 1
+                            else:
+                                successful_constraint_fixes += 1
+
+                if idx_inner == 0 and idx_outer == 0:
+                    perturbations = perturbation
+                else:
+                    perturbations = np.append(perturbations, perturbation, axis=0)
+
+        if check_constraint_fix_success:
+            if successful_constraint_fixes + failed_constraint_fixes > 0:
+                constraint_fix_ratio = successful_constraint_fixes / (successful_constraint_fixes + failed_constraint_fixes)
+                print(f"successful constraint fixes ratio: {constraint_fix_ratio}")
+        return perturbations
+
+    def node_eval_function(self, perturbations, start, start_proba, victim):
+        if len(perturbations.shape) == 1:
+            perturbations = np.expand_dims(perturbations, 0)
+        expanded_start_proba = np.array([start_proba]*perturbations.shape[0])
+        victim_proba_prediction = victim.predict_proba(perturbations)[:,global_defaults["target_label"]]
+
+        proba_change = np.subtract(victim_proba_prediction, expanded_start_proba)
+
+        expanded_start = np.reshape(np.repeat(start, perturbations.shape[0]), perturbations.shape)
+        distance = self.distance_metric.dist_func(expanded_start, perturbations, pairwise=True)
+
+        safe_dist = np.max(np.append(np.expand_dims(distance, axis=1), np.reshape(np.array([10**float(self.DEFAULTS["eps_exp"])]*distance.shape[0]), (distance.shape[0], 1)), axis=1), axis=1, keepdims=False)
+        metrics = np.divide(proba_change, safe_dist)
+        return metrics*(-1) # negate metrics so we can use out of the box min heap
+
+
+class Accel_Baseline_adv(Baseline_adv, sk.base.BaseEstimator):
+    DEFAULTS = {
+        "target": -500, # negative means this managed to flip the value (we negate for min heap purposes)
+        "max_iter": 20, # maximum number of search steps before we abort and just take the best value seen so far
+        "parameters": [False, 10, 50, 10, -500],
+        "eps_exp": -10,
+        "expand_type": "gridstep",
+        "record_search_num": 1,
+        "precision": 3,
+        "batch_size": 5000,
+    }
+
+    def __init__(self, victim, constraints, metadata, log_path, log_style, constraint_correction=DEFAULTS["parameters"][0], queue_size=DEFAULTS["parameters"][1], total_step_num=DEFAULTS["parameters"][2], max_expand_nodes=DEFAULTS["parameters"][3], target=DEFAULTS["parameters"][4], expand_type=DEFAULTS["expand_type"]):
+        super().__init__(self, victim, constraints, metadata, log_path, log_style, constraint_correction, queue_size, total_step_num, max_expand_nodes, target, expand_type)
+        self.significant_decimals = {}
+
+
+    # TODO: translate from and to cat values (needed for other datasets)
+    def fit(self, x, y): #training here just means storing the seen ranges in x so we can define reasonable step sizes. We also restrict ourselves to remain in distribution -> reasonable restriction???
+        self.distance_metric = Gower_dist(x, self.metadata, dynamic=False) #set these to be dynamic so we dont have exploding gower distances
+        for feature in self.mutable_feature_choices.keys():
+            feature_idx = self.feature_idxs[feature]
+            feature_vals = x[:,feature_idx]
+            if self.feature_types[feature] == "cat":
+                self.mutable_feature_choices[feature] = list(set(feature_vals.to_list()))
+            elif self.feature_types[feature] == "int": 
+                minimum = np.min(feature_vals)
+                maximum = np.max(feature_vals)
+                step_size = (maximum - minimum)/self.total_step_num
+                choices = list(set([round(step_num * step_size) for step_num in range(self.total_step_num)]))
+                self.mutable_feature_choices[feature] = choices
+                self.step_sizes[feature] = max(round(step_size), 1)
+            elif self.feature_types[feature] == "real":
+                minimum = np.min(feature_vals)
+                maximum = np.max(feature_vals)
+                step_size = (maximum - minimum)/self.total_step_num
+                choices = [step_num * step_size for step_num in range(self.total_step_num)]
+                self.mutable_feature_choices[feature] = choices
+                self.step_sizes[feature] = step_size
                 self.significant_decimals[feature] = self.get_significant_decimals(x, feature)
         self.perturbation_tensor = self.get_perturbation_tensor(x)
         return self
 
-    # NOTE: this is far from perfect. Looking at the min value of the dataset and choosing based on that is functional, but it would be better if we looked at the point distances along any given feature
+    def attack(self, x):
+        base_proba = self.victim.predict_proba(x)[:, global_defaults["target_label"]] # the base label probabilities from which we start
+        batch_num = int(x.shape[0]/self.DEFAULTS["batch_size"])+1
+        batch_idx = 0
+        adv_samples = []
+        if self.DEFAULTS["record_search_num"] >= x.shape[0]:
+            while batch_idx < batch_num:
+                min_idx = batch_idx*self.DEFAULTS["batch_size"]
+                max_idx = batch_idx+1*self.DEFAULTS["batch_size"]
+                batch_x = x[min_idx:max_idx]
+                batch_base_proba = base_proba[min_idx:max_idx]
+                adv_sample_batch = self.accel_adv_best_first_search(batch_x, batch_base_proba, self.victim, collect_metrics=True)
+                if self.local_log:
+                    self.store_logs()
+                if self.online_log:
+                    self.wandb_log()
+                adv_samples.extend(adv_sample_batch)
+                batch_idx += 1
+        else:
+            if self.DEFAULTS["record_search_num"] > 0:
+                num_record_search = self.DEFAULTS["record_search_num"]
+                record_pre_batch_x = x[:num_record_search]
+                record_pre_batch_probas = base_proba[:num_record_search]
+                x = x[num_record_search:]
+                base_proba = base_proba[num_record_search:]
+                adv_sample_batch = self.accel_adv_best_first_search(record_pre_batch_x, record_pre_batch_probas, self.victim, collect_metrics=True)
+                if self.local_log:
+                    self.store_logs()
+                if self.online_log:
+                    self.wandb_log()
+                adv_samples.extend(adv_sample_batch)
+
+            while batch_idx < batch_num:
+                min_idx = batch_idx*self.DEFAULTS["batch_size"]
+                max_idx = batch_idx+1*self.DEFAULTS["batch_size"]
+                batch_x = x[min_idx:max_idx]
+                batch_base_proba = base_proba[min_idx:max_idx]
+                adv_sample_batch = self.accel_adv_best_first_search(batch_x, batch_base_proba, self.victim, collect_metrics=False)
+                adv_samples.extend(adv_sample_batch)
+                batch_idx += 1
+        return torch.stack(list(map(lambda x: x[1], adv_samples)), dim=0).numpy()
+
+        # NOTE: this is far from perfect. Looking at the min value of the dataset and choosing based on that is functional, but it would be better if we looked at the point distances along any given feature
+    
     def get_significant_decimals(self, x, feature):
         feature_idx = self.feature_idxs[feature]
         feature_vals = x[:][feature_idx]
@@ -226,82 +515,6 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
             perturbation_tensor = torch.from_numpy(perturbations)
         return perturbation_tensor
 
-    def store_logs(self):
-        obj_identifier = hex(id(self))[2:].upper()
-        file_path = f"{self.log_path}[{obj_identifier}]search_logs.json"
-        log_obj = json.dumps(self.log_results)
-        with open(file_path, "w") as outfile:
-            outfile.write(log_obj)
-
-    def wandb_log(self):
-        adv_id = hex(id(self))[2:].upper()
-        for result_idx in self.log_results.keys():
-            for idx in range(len(self.log_results[result_idx]["step"])):
-                wandb.log(
-                data={
-                    f"{adv_id}_search{result_idx}/prob_diff":self.log_results[result_idx]["prob_diff"],
-                    f"{adv_id}_search{result_idx}/gower_dist": self.log_results[result_idx]["gower_dist"],
-                    f"{adv_id}_search{result_idx}/constraint_loss": self.log_results[result_idx]["const_loss"],
-                    f"{adv_id}_search{result_idx}/cost_function": self.log_results[result_idx]["cost_func"],
-                    f"{adv_id}_search{result_idx}/step": self.log_results[result_idx]["step"],
-                    f"{adv_id}_search{result_idx}/total_prob": self.log_results[result_idx]["total_node_prob"]
-                }
-            )
-
-    def attack(self, x):
-        base_proba = self.victim.predict_proba(x)[:, global_defaults["target_label"]] # the base label probabilities from which we start
-        if self.DEFAULTS["accel_attack"]:
-            batch_num = int(x.shape[0]/self.DEFAULTS["batch_size"])+1
-            batch_idx = 0
-            adv_samples = []
-            if self.DEFAULTS["record_search_num"] >= x.shape[0]:
-                while batch_idx < batch_num:
-                    min_idx = batch_idx*self.DEFAULTS["batch_size"]
-                    max_idx = batch_idx+1*self.DEFAULTS["batch_size"]
-                    batch_x = x[min_idx:max_idx]
-                    batch_base_proba = base_proba[min_idx:max_idx]
-                    adv_sample_batch = self.accel_adv_best_first_search(batch_x, batch_base_proba, self.victim, collect_metrics=True)
-                    if self.local_log:
-                        self.store_logs()
-                    if self.online_log:
-                        self.wandb_log()
-                    adv_samples.extend(adv_sample_batch)
-                    batch_idx += 1
-            else:
-                if self.DEFAULTS["record_search_num"] > 0:
-                    num_record_search = self.DEFAULTS["record_search_num"]
-                    record_pre_batch_x = x[:num_record_search]
-                    record_pre_batch_probas = base_proba[:num_record_search]
-                    x = x[num_record_search:]
-                    base_proba = base_proba[num_record_search:]
-                    adv_sample_batch = self.accel_adv_best_first_search(record_pre_batch_x, record_pre_batch_probas, self.victim, collect_metrics=True)
-                    if self.local_log:
-                        self.store_logs()
-                    if self.online_log:
-                        self.wandb_log()
-                    adv_samples.extend(adv_sample_batch)
-
-                while batch_idx < batch_num:
-                    min_idx = batch_idx*self.DEFAULTS["batch_size"]
-                    max_idx = batch_idx+1*self.DEFAULTS["batch_size"]
-                    batch_x = x[min_idx:max_idx]
-                    batch_base_proba = base_proba[min_idx:max_idx]
-                    adv_sample_batch = self.accel_adv_best_first_search(batch_x, batch_base_proba, self.victim, collect_metrics=False)
-                    adv_samples.extend(adv_sample_batch)
-                    batch_idx += 1
-            return torch.stack(list(map(lambda x: x[1], adv_samples)), dim=0).numpy()
-        else:
-            adv_samples = None
-            for sample_idx in range(x.shape[0]):
-                adv_sample = self.adv_best_first_search(x[sample_idx], base_proba[sample_idx], self.victim, collect_metrics=sample_idx<self.DEFAULTS["record_search_num"], search_idx=sample_idx) 
-                if adv_samples is None:
-                    adv_samples = np.expand_dims(adv_sample, 0)
-                else:
-                    adv_sample = np.expand_dims(adv_sample, 0)
-                    adv_samples = np.append(adv_samples, adv_sample, 0)
-            return adv_samples
-    
-    # TODO: translate from and to cat values (needed for other datasets)
     def accel_adv_best_first_search(self, startnodes, base_probas, victim, collect_metrics=False):
         if isinstance(startnodes, np.ndarray):
             startnodes = torch.from_numpy(startnodes)
@@ -444,179 +657,6 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
             chunks.append(chunk)
         return torch.cat(chunks, dim=0), idx_mapping
         
-    # NOTE: some loss of fidelity seems to occur with the node_eval_result not perfectly aligning with -prob_diff/gower_dist. Currently believe tha this is due to a rounding error
-    def collect_metrics(self, victim, search_idx, node_eval_result, current_iter, current_node, start, base_proba):
-        # classifier_id = hex(id(self))[2:].upper()
-        # expanded_start_proba = torch.from_numpy(victim.predict_proba(start)[:,global_defaults["target_label"]])
-        victim_proba_prediction = torch.from_numpy(victim.predict_proba(current_node)[:,global_defaults["target_label"]])
-        proba_change = torch.subtract(victim_proba_prediction, base_proba)
-        prob_diff = proba_change
-        gower_dist = self.distance_metric.dist_func(start, current_node, pairwise=True)
-        running_loss = 0
-        for constraint_executor in self.constraint_executors:
-            running_loss += constraint_executor.execute(torch.from_numpy(np.expand_dims(current_node, axis=0))).sum()
-        const_loss = running_loss
-
-        local_log_results = {
-                "prob_diff": [prob_diff],
-                "gower_dist": [gower_dist],
-                "const_loss": [const_loss],
-                "cost_func": [node_eval_result],
-                "step": [current_iter],
-                "total_node_prob": [victim_proba_prediction]
-            }
-        self.append_to_log_dict(search_idx, current_iter, local_log_results)
-
-    def append_to_log_dict(self, search_idx, current_iter, new_results):
-        if search_idx in self.log_results.keys():
-            if current_iter not in self.log_results[search_idx]["step"]:
-                for key in self.log_results[search_idx].keys():
-                    self.log_results[search_idx][key].extend(new_results[key])
-            else:
-                search_idx = search_idx + self.DEFAULTS["batch_size"]
-                self.append_to_log_dict(search_idx, current_iter, new_results) # not as optimal because recursion, but looks elegant in code so whatever.
-        else:
-            self.log_results[search_idx] = new_results
-
-    def adv_best_first_search(self, start, base_proba, victim, collect_metrics=False, search_idx=0):
-        open_nodes = [(self.node_eval_function(start, start, base_proba, victim).item(), 0, start)] # the attached value of the start node should always be 0, but you never know...
-        hq.heapify(open_nodes)
-        closed_nodes = []
-        best_node = (open_nodes[0][0],open_nodes[0][2])
-        current_iter = 0
-        expaded_node_ctr = 1
-        while len(open_nodes) > 0 and current_iter < self.max_iterations:
-            node_eval_result, _ ,current_node = hq.heappop(open_nodes)
-
-            if collect_metrics:
-                self.collect_metrics(victim, search_idx, node_eval_result, current_iter, current_node, start)
-
-            if len(closed_nodes) == 0 or not any([np.all(np.equal(current_node, closed_node)) for closed_node in closed_nodes]): #check if this node config is already present in closed nodes
-                closed_nodes.append(current_node)
-            if node_eval_result <= self.target: # we are trying to maximize the goal function here
-                return current_node
-            if node_eval_result < best_node[0]:
-                best_node = (node_eval_result, current_node)
-            
-            if self.expand_type == "fixgrid":
-                perturbations = self.generate_next_nodes_fixgrid(current_node)
-            else:
-                perturbations = self.generate_next_nodes_gridstep(current_node)
-
-            perturbation_eval_results = self.node_eval_function(perturbations, start, base_proba, victim)
-
-            new_queue_elements = []
-            for idx in range(perturbations.shape[0]):
-                new_queue_elements.append((perturbation_eval_results[idx].item(), expaded_node_ctr, perturbations[idx]))
-                expaded_node_ctr += 1
-
-            for new_queue_element in new_queue_elements:
-                if not any([np.all(np.equal(new_queue_element[2], closed_node)) for closed_node in closed_nodes]):
-                    hq.heappush(open_nodes, new_queue_element)
-
-            if len(open_nodes) > self.queue_size:
-                open_nodes.sort()
-                open_nodes = open_nodes[0:self.queue_size] #remove the largest elements to cut queue down to size again
-
-            current_iter += 1
-        
-        return best_node[1]
-
-    def generate_next_nodes_gridstep(self, start_node):
-        if len(start_node.shape) == 1:
-            start_node = np.expand_dims(start_node, 0)
-        for idx_outer, feature in enumerate(self.mutable_feature_choices):
-            feature_idx = self.feature_idxs[feature]
-            if self.feature_types[feature] == "cat":
-                current_value = start_node[0][self.feature_idxs[feature]]
-                if current_value in self.mutable_feature_choices[feature]:
-                    possible_changes = self.mutable_feature_choices[feature].copy()
-                    possible_changes.remove(current_value)
-                else:
-                    possible_changes = self.mutable_feature_choices[feature]
-                possible_changes = np.array([possible_changes])
-            else:
-                if self.feature_types[feature] == "int":
-                    border = int(self.step_sizes[feature]*self.max_expand_nodes/2)
-                    start = -border
-                    end = border
-                    deltas = np.arange(start=start, stop=end, step=self.step_sizes[feature], dtype=int)
-                else:
-                    border = self.step_sizes[feature]*self.max_expand_nodes/2
-                    start = -border
-                    end = border
-                    deltas = np.linspace(start=start, stop=end, num=self.max_expand_nodes)
-
-                deltas = deltas[deltas != 0]
-                possible_changes = deltas + start_node[0,feature_idx] #NOTE: this assumes we only ever pass this function a single node to expand...
-                possible_changes = np.expand_dims(possible_changes, axis=0)
-
-            perturbation = np.copy(start_node)
-            perturbation = np.repeat(perturbation, possible_changes.shape[1], axis=0)
-            perturbation[:,feature_idx] = possible_changes
-
-            if idx_outer == 0:
-                perturbations = perturbation
-            else:
-                perturbations = np.append(perturbations, perturbation, axis=0)
-
-        return perturbations
-    
-    def generate_next_nodes_fixgrid(self, start_node, check_constraint_fix_success= True):
-        if check_constraint_fix_success:
-            successful_constraint_fixes = 0
-            failed_constraint_fixes = 0
-        if len(start_node.shape) == 1:
-            start_node = np.expand_dims(start_node, 0) 
-        for idx_outer, feature in enumerate(self.mutable_feature_choices):
-            current_value = start_node[0][self.feature_idxs[feature]]
-            if current_value in self.mutable_feature_choices[feature]:
-                possible_changes = self.mutable_feature_choices[feature].copy()
-                possible_changes.remove(current_value)
-            else:
-                possible_changes = self.mutable_feature_choices[feature]
-
-            for idx_inner, change in enumerate(possible_changes):
-                perturbation = np.copy(start_node)
-                perturbation[0][self.feature_idxs[feature]] = change
-
-                timestamp = time.time()
-                if self.constraint_correction: # run this locally, so we dont fix constraints unnessecarily. Dont know if that would do something.
-                    if self.constraints_checker.check_constraints(start_node, perturbation)[0] == 0: # returns False if a constraint was violated
-                        perturbation = self.constraint_fixer.fix(perturbation)
-                        if check_constraint_fix_success:
-                            if self.constraints_checker.check_constraints(start_node, perturbation)[0] == 0:
-                                # print("WARNING: Constraint fix unsusccessful")
-                                failed_constraint_fixes += 1
-                            else:
-                                successful_constraint_fixes += 1
-
-                if idx_inner == 0 and idx_outer == 0:
-                    perturbations = perturbation
-                else:
-                    perturbations = np.append(perturbations, perturbation, axis=0)
-
-        if check_constraint_fix_success:
-            if successful_constraint_fixes + failed_constraint_fixes > 0:
-                constraint_fix_ratio = successful_constraint_fixes / (successful_constraint_fixes + failed_constraint_fixes)
-                print(f"successful constraint fixes ratio: {constraint_fix_ratio}")
-        return perturbations
-
-    def node_eval_function(self, perturbations, start, start_proba, victim):
-        if len(perturbations.shape) == 1:
-            perturbations = np.expand_dims(perturbations, 0)
-        expanded_start_proba = np.array([start_proba]*perturbations.shape[0])
-        victim_proba_prediction = victim.predict_proba(perturbations)[:,global_defaults["target_label"]]
-
-        proba_change = np.subtract(victim_proba_prediction, expanded_start_proba)
-
-        expanded_start = np.reshape(np.repeat(start, perturbations.shape[0]), perturbations.shape)
-        distance = self.distance_metric.dist_func(expanded_start, perturbations, pairwise=True)
-
-        safe_dist = np.max(np.append(np.expand_dims(distance, axis=1), np.reshape(np.array([10**float(self.DEFAULTS["eps_exp"])]*distance.shape[0]), (distance.shape[0], 1)), axis=1), axis=1, keepdims=False)
-        metrics = np.divide(proba_change, safe_dist)
-        return metrics*(-1) # negate metrics so we can use out of the box min heap
-
 
 AVAILABLE_ATTACKERS = {
     "dummy": Dummy_adv,
