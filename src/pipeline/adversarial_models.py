@@ -14,13 +14,14 @@ import time
 from defaults import DEFAULTS as global_defaults
 import wandb
 import torch
-import os
 from bounded_prio_queue import Bounded_Priority_Queue
 import utils
+import json
+from defaults import Log_styles, AVAILABLE_LOG_STYLES
 
 class Adv_model(ABC):
     DEFAULTS = None
-    def __init__(self, victim, constraints, metadata, *hyperparams):
+    def __init__(self, victim, constraints, metadata, log_path, log_style, *hyperparams):
         self.victim = victim
         self.constraints = constraints
         self.hyperparams = [hyperparam for hyperparam in hyperparams]
@@ -44,7 +45,7 @@ class Adv_model(ABC):
 # baseline adversarial that changes every real valued parameter by a normal distributed random amount. hyperparameters are mean and std_dev of the normal distribution
 # hyperparameter optimization might not converge, due to the randomness of behavior here, but so what.
 class Dummy_adv(Adv_model):
-    def __init__(self, victim, constraints, metadata, *hyperparams):
+    def __init__(self, victim, constraints, metadata, log_path, log_style, *hyperparams):
         super().__init__(victim, constraints, metadata, *hyperparams)
         self.real_feature_map = np.array([feat_type=="real" for feat_type in metadata.query("mutable == True")["type"].values.tolist()]).astype(int)
         self.random_generator = np.random.default_rng()
@@ -77,13 +78,13 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         "parameters": [False, 10, 50, 10, -500],
         "eps_exp": -10,
         "expand_type": "gridstep",
-        "record_search_num": 10,
+        "record_search_num": 1,
         "precision": 3,
         "accel_attack": True,
         "batch_size": 5000,
     }
 
-    def __init__(self, victim, constraints, metadata, constraint_correction=DEFAULTS["parameters"][0], queue_size=DEFAULTS["parameters"][1], total_step_num=DEFAULTS["parameters"][2], max_expand_nodes=DEFAULTS["parameters"][3], target=DEFAULTS["parameters"][4], expand_type=DEFAULTS["expand_type"]):
+    def __init__(self, victim, constraints, metadata, log_path, log_style, constraint_correction=DEFAULTS["parameters"][0], queue_size=DEFAULTS["parameters"][1], total_step_num=DEFAULTS["parameters"][2], max_expand_nodes=DEFAULTS["parameters"][3], target=DEFAULTS["parameters"][4], expand_type=DEFAULTS["expand_type"]):
         hyperparams = [constraint_correction, queue_size, total_step_num, max_expand_nodes, target]
         super().__init__(victim, constraints, metadata, *hyperparams)
         self.features = metadata["feature"].tolist()
@@ -93,6 +94,9 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         self.feature_idxs = {}
         self.feature_types = {}
         self.significant_decimals = {}
+        self.log_results = {}
+        self.log_path = log_path
+        self.log_style = log_style
         for idx, feature in enumerate(self.features): # NOTE: really hope the order of the metadata feature list aligns with the order of x
             if metadata.query("feature == @feature")["mutable"].to_list()[0]:
                 self.mutable_feature_choices[feature] = None
@@ -120,6 +124,9 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
             ))
         self.target = target
         self.max_iterations = self.DEFAULTS["max_iter"]
+
+        self.local_log = log_style == Log_styles.BOTH or log_style == Log_styles.LOCAL
+        self.online_log = log_style == Log_styles.BOTH or log_style == Log_styles.WANDB
 
     @staticmethod
     def HYPERPARAM_NAMES(): #names are in order
@@ -219,29 +226,69 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
             perturbation_tensor = torch.from_numpy(perturbations)
         return perturbation_tensor
 
+    def store_logs(self):
+        obj_identifier = hex(id(self))[2:].upper()
+        file_path = f"{self.log_path}[{obj_identifier}]search_logs.json"
+        log_obj = json.dumps(self.log_results)
+        with open(file_path, "w") as outfile:
+            outfile.write(log_obj)
+
+    def wandb_log(self):
+        adv_id = hex(id(self))[2:].upper()
+        for result_idx in self.log_results.keys():
+            for idx in range(len(self.log_results[result_idx]["step"])):
+                wandb.log(
+                data={
+                    f"{adv_id}_search{result_idx}/prob_diff":self.log_results[result_idx]["prob_diff"],
+                    f"{adv_id}_search{result_idx}/gower_dist": self.log_results[result_idx]["gower_dist"],
+                    f"{adv_id}_search{result_idx}/constraint_loss": self.log_results[result_idx]["const_loss"],
+                    f"{adv_id}_search{result_idx}/cost_function": self.log_results[result_idx]["cost_func"],
+                    f"{adv_id}_search{result_idx}/step": self.log_results[result_idx]["step"],
+                    f"{adv_id}_search{result_idx}/total_prob": self.log_results[result_idx]["total_node_prob"]
+                }
+            )
+
     def attack(self, x):
         base_proba = self.victim.predict_proba(x)[:, global_defaults["target_label"]] # the base label probabilities from which we start
         if self.DEFAULTS["accel_attack"]:
             batch_num = int(x.shape[0]/self.DEFAULTS["batch_size"])+1
             batch_idx = 0
             adv_samples = []
-            if self.DEFAULTS["record_search_num"] > 0:
-                num_record_search = self.DEFAULTS["record_search_num"]
-                record_pre_batch_x = x[:num_record_search]
-                record_pre_batch_probas = base_proba[:num_record_search]
-                x = x[num_record_search:]
-                base_proba = base_proba[num_record_search:]
-                adv_sample_batch = self.accel_adv_best_first_search(record_pre_batch_x, record_pre_batch_probas, self.victim, collect_metrics=True)
-                adv_samples.extend(adv_sample_batch)
+            if self.DEFAULTS["record_search_num"] >= x.shape[0]:
+                while batch_idx < batch_num:
+                    min_idx = batch_idx*self.DEFAULTS["batch_size"]
+                    max_idx = batch_idx+1*self.DEFAULTS["batch_size"]
+                    batch_x = x[min_idx:max_idx]
+                    batch_base_proba = base_proba[min_idx:max_idx]
+                    adv_sample_batch = self.accel_adv_best_first_search(batch_x, batch_base_proba, self.victim, collect_metrics=True)
+                    if self.local_log:
+                        self.store_logs()
+                    if self.online_log:
+                        self.wandb_log()
+                    adv_samples.extend(adv_sample_batch)
+                    batch_idx += 1
+            else:
+                if self.DEFAULTS["record_search_num"] > 0:
+                    num_record_search = self.DEFAULTS["record_search_num"]
+                    record_pre_batch_x = x[:num_record_search]
+                    record_pre_batch_probas = base_proba[:num_record_search]
+                    x = x[num_record_search:]
+                    base_proba = base_proba[num_record_search:]
+                    adv_sample_batch = self.accel_adv_best_first_search(record_pre_batch_x, record_pre_batch_probas, self.victim, collect_metrics=True)
+                    if self.local_log:
+                        self.store_logs()
+                    if self.online_log:
+                        self.wandb_log()
+                    adv_samples.extend(adv_sample_batch)
 
-            while batch_idx < batch_num:
-                min_idx = batch_idx*self.DEFAULTS["batch_size"]
-                max_idx = batch_idx+1*self.DEFAULTS["batch_size"]
-                batch_x = x[min_idx:max_idx]
-                batch_base_proba = base_proba[min_idx:max_idx]
-                adv_sample_batch = self.accel_adv_best_first_search(batch_x, batch_base_proba, self.victim, collect_metrics=False)
-                adv_samples.extend(adv_sample_batch)
-                batch_idx += 1
+                while batch_idx < batch_num:
+                    min_idx = batch_idx*self.DEFAULTS["batch_size"]
+                    max_idx = batch_idx+1*self.DEFAULTS["batch_size"]
+                    batch_x = x[min_idx:max_idx]
+                    batch_base_proba = base_proba[min_idx:max_idx]
+                    adv_sample_batch = self.accel_adv_best_first_search(batch_x, batch_base_proba, self.victim, collect_metrics=False)
+                    adv_samples.extend(adv_sample_batch)
+                    batch_idx += 1
             return torch.stack(list(map(lambda x: x[1], adv_samples)), dim=0).numpy()
         else:
             adv_samples = None
@@ -399,7 +446,7 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         
     # NOTE: some loss of fidelity seems to occur with the node_eval_result not perfectly aligning with -prob_diff/gower_dist. Currently believe tha this is due to a rounding error
     def collect_metrics(self, victim, search_idx, node_eval_result, current_iter, current_node, start, base_proba):
-        classifier_id = hex(id(self))[2:].upper()
+        # classifier_id = hex(id(self))[2:].upper()
         # expanded_start_proba = torch.from_numpy(victim.predict_proba(start)[:,global_defaults["target_label"]])
         victim_proba_prediction = torch.from_numpy(victim.predict_proba(current_node)[:,global_defaults["target_label"]])
         proba_change = torch.subtract(victim_proba_prediction, base_proba)
@@ -409,15 +456,27 @@ class Baseline_adv(Adv_model, sk.base.BaseEstimator):
         for constraint_executor in self.constraint_executors:
             running_loss += constraint_executor.execute(torch.from_numpy(np.expand_dims(current_node, axis=0))).sum()
         const_loss = running_loss
-        wandb.log(
-            data={
-                f"{classifier_id}_search{search_idx}/prob_diff":prob_diff,
-                f"{classifier_id}_search{search_idx}/gower_dist": gower_dist,
-                f"{classifier_id}_search{search_idx}/constraint_loss": const_loss,
-                f"{classifier_id}_search{search_idx}/cost_function": node_eval_result,
-                f"{classifier_id}_search{search_idx}/step": current_iter
+
+        local_log_results = {
+                "prob_diff": [prob_diff],
+                "gower_dist": [gower_dist],
+                "const_loss": [const_loss],
+                "cost_func": [node_eval_result],
+                "step": [current_iter],
+                "total_node_prob": [victim_proba_prediction]
             }
-        )
+        self.append_to_log_dict(search_idx, current_iter, local_log_results)
+
+    def append_to_log_dict(self, search_idx, current_iter, new_results):
+        if search_idx in self.log_results.keys():
+            if current_iter not in self.log_results[search_idx]["step"]:
+                for key in self.log_results[search_idx].keys():
+                    self.log_results[search_idx][key].extend(new_results[key])
+            else:
+                search_idx = search_idx + self.DEFAULTS["batch_size"]
+                self.append_to_log_dict(search_idx, current_iter, new_results) # not as optimal because recursion, but looks elegant in code so whatever.
+        else:
+            self.log_results[search_idx] = new_results
 
     def adv_best_first_search(self, start, base_proba, victim, collect_metrics=False, search_idx=0):
         open_nodes = [(self.node_eval_function(start, start, base_proba, victim).item(), 0, start)] # the attached value of the start node should always be 0, but you never know...

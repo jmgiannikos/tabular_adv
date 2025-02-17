@@ -141,10 +141,10 @@ class Gower_dist:
         else:
             dists = self.get_num_dists(x, y, True)
         
-        weights = self.expand_to(dists, self.weighting_tensor)
+        #weights = self.expand_to(dists, self.weighting_tensor)
 
-        weighted_dists = torch.mul(dists, weights)
-        return weighted_dists
+        #weighted_dists = torch.mul(dists, weights)
+        return dists
 
     def dist_func(self, y, x, pairwise=False):
         if len(self.cat_idxs) != 0:
