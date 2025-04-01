@@ -1,6 +1,7 @@
 import torch 
 import numpy as np
 from defaults import DEFAULTS
+import pandas
 
 class Gower_dist:
     # expecting weighting dict of form feature_name: weight
@@ -21,7 +22,8 @@ class Gower_dist:
             x_cat = None
 
         if not dynamic:
-            x_num = torch.from_numpy(x_num)
+            if not isinstance(x_num, torch.Tensor):
+                x_num = torch.from_numpy(x_num).to(self.cuda_device)
             self.num_ranges = self.get_ranges(x_num, safe_div_factor=safe_div_factor)
         else:
             self.x_num = x_num
@@ -65,8 +67,10 @@ class Gower_dist:
         return feature_list, num_idxs, num_features, cat_idxs, cat_features
     
     def split_num_and_cat(self, data, num_idxs, cat_idxs):         
-        if not isinstance(data, np.ndarray):
+        if isinstance(data, pandas.DataFrame):
             data = data.to_numpy()
+        elif isinstance(data, torch.Tensor):
+            data = data.numpy()
         data_num = torch.from_numpy(data[:, np.array(num_idxs)]).to(self.cuda_device)
         data_cat = torch.from_numpy(data[:, np.array(cat_idxs)]).to(self.cuda_device)
         return data_num, data_cat
@@ -107,7 +111,7 @@ class Gower_dist:
             divisor = self.expand_to(x,self.num_ranges)
         else:
             x_tensor = np.append(self.x_num, x, axis=0) #collect all seen data points
-            x_tensor = torch.from_numpy(np.append(x_tensor, y, axis=0))
+            x_tensor = torch.from_numpy(np.append(x_tensor, y, axis=0)).to(self.cuda_device)
             divisor = self.get_ranges(x_tensor, safe_div_factor=self.safe_div_factor) 
 
         dist = torch.div(torch.abs(torch.sub(x, y)), divisor)
@@ -117,15 +121,15 @@ class Gower_dist:
         if not pairwise:
             x, y = self.expand_tensors(x, y)
 
-        eq_tensor = torch.eq(x,y)
+        eq_tensor = torch.logical_not(torch.eq(x,y))
         dist = eq_tensor.type(x.dtype)
         return dist
 
     def get_feature_wise_distances(self, x, y):
         if not isinstance(x, torch.Tensor):
-            x = torch.Tensor(x)
+            x = torch.Tensor(x).to(self.cuda_device)
         if not isinstance(y, torch.Tensor):
-            y = torch.Tensor(y)
+            y = torch.Tensor(y).to(self.cuda_device)
             
         if len(self.cat_idxs) != 0:
             x_num, x_cat = self.split_num_and_cat(x, self.num_idxs, self.cat_idxs)
@@ -137,7 +141,11 @@ class Gower_dist:
             dists_num = self.get_num_dists(x_num, y_num, True)
             dists_cat = self.get_cat_dists(x_cat, y_cat, True)
     
-            dists = torch.cat([dists_num, dists_cat], dim=2)
+            dists = torch.Tensor([[torch.nan]*x.shape[1]]*x.shape[0]).type(dists_num.dtype)
+            dists[:,self.num_idxs] = dists_num
+            dists[:,self.cat_idxs] = dists_cat.type(dists_num.dtype)
+
+            #dists = torch.cat([dists_num, dists_cat], dim=1)
         else:
             dists = self.get_num_dists(x, y, True)
         
@@ -148,6 +156,11 @@ class Gower_dist:
 
     def dist_func(self, y, x, pairwise=False):
         if len(self.cat_idxs) != 0:
+            if len(x.shape) < 2:
+                x = torch.unsqueeze(x,dim=0)
+            if len(y.shape) < 2:
+                y = torch.unsqueeze(y,dim=0)
+
             x_num, x_cat = self.split_num_and_cat(x, self.num_idxs, self.cat_idxs)
     
             y_num, y_cat = self.split_num_and_cat(y, self.num_idxs, self.cat_idxs)
@@ -159,7 +172,9 @@ class Gower_dist:
             dists_num = self.get_num_dists(x_num, y_num, pairwise)
             dists_cat = self.get_cat_dists(x_cat, y_cat, pairwise)
     
-            dists = torch.cat([dists_num, dists_cat], dim=2)
+            dists = torch.DoubleTensor([[torch.nan]*x.shape[1]]*x.shape[0])
+            dists[:,self.num_idxs] = dists_num
+            dists[:,self.cat_idxs] = dists_cat
 
         else: 
             if x is None:
@@ -168,7 +183,7 @@ class Gower_dist:
                 if not isinstance(x, torch.Tensor):
                     if not isinstance(x, np.ndarray):
                         x = x.to_numpy()
-                    x_num = torch.from_numpy(x)
+                    x_num = torch.from_numpy(x).to(self.cuda_device)
                 else:
                     x_num = x
             

@@ -4,11 +4,12 @@ from tabularbench.constraints.constraints_checker import ConstraintChecker
 import skopt as sko
 import numpy as np
 import torch
-from defaults import DEFAULTS
+from defaults import DEFAULTS, Log_styles
 from hyperparameter_search_policies import opt_types, fixed_hyperparam, random_search
+from utils import prune_labels
 
 class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
-    def __init__(self, model_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, check_constraints, results_path, tolerance=DEFAULTS["tolerance"]): #TODO: passing around the whole dataset like this is cumbersome, instead just pass ranges and feature types
+    def __init__(self, model_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, check_constraints, results_path, log_style, tolerance=DEFAULTS["tolerance"]): #TODO: passing around the whole dataset like this is cumbersome, instead just pass ranges and feature types
         self.model_class = model_class # model should be a class and have a static method that marks it as trainable or non-trainable called trainable
         self.search_dimensions = search_dimensions # see skopt.gp_minimize for the specifics
         self.best_params = None 
@@ -24,19 +25,21 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
         if model_class.TRAINABLE():
             self.fitted_model = None
         self.check_constraints = check_constraints
+        self.log_style = log_style
 
     def attack(self, X):
         if self.model_class.TRAINABLE():
-            attacker_model = self.fitted_model
+            self.attacker_model = self.fitted_model
         else:
-            attacker_model = self.model_class(self.victim, self.constraints, self.metadata, self.results_path, *self.best_params)
-        adv_samples = attacker_model.attack(X)
+            self.attacker_model = self.model_class(self.victim, self.constraints, self.metadata, self.results_path, self.log_style, *self.best_params)
+        adv_samples = self.attacker_model.attack(X)
         return adv_samples
 
     def fit(self, X, y, ncalls=DEFAULTS["ncalls"]):
         # these are made object variables, so that other functions in this class can access them without needing to have them passed as args, which sk.crossvalidate doesnt do for instance
-        self.X = X 
-        self.y = y
+        X, y = prune_labels(X, y, self.victim) # prune locally
+        self.X = X
+        self.y = y 
 
         if self.model_class.TRAINABLE():
             objective = self.trainable_objective
@@ -53,23 +56,23 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
             result_dict = sko.gp_minimize(objective, self.search_dimensions, n_calls=ncalls)
 
         if self.model_class.TRAINABLE():
-            self.fitted_model = self.model_class(self.victim, self.constraints, self.metadata, self.results_path, *result_dict.x).fit(X, y)
+            self.fitted_model = self.model_class(self.victim, self.constraints, self.metadata, self.results_path, self.log_style, *result_dict.x).fit(X, y)
         
         self.hyperparam_result_dict = result_dict # store result dict for later analysis
         self.best_params = [result_dict.x] # this is wrapped in a list, because of the weird parameter shape the optimization function uses internally. This allows consistency between the modes
         return self
-        
+  
     def trainable_objective(self, *args):
         if len(args) == 1 and isinstance(args[0], list):
             args = args[0]
-        model = self.model_class(self.victim, self.constraints, self.metadata, self.results_path, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
+        model = self.model_class(self.victim, self.constraints, self.metadata, self.results_path, Log_styles.NOLOG, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
         scores = cross_validate(model, self.X, self.y, scoring=self.objective, cv=DEFAULTS["crossval_folds"])
         score = np.mean(scores["test_score"])
         return score
 
     def static_objective(self, *args):
         args = args[0]
-        model = self.model_class(self.victim, self.constraints, self.metadata, self.results_path, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
+        model = self.model_class(self.victim, self.constraints, self.metadata, self.results_path, Log_styles.NOLOG, *args) #args (hyperparameters) that the model takes need to align with the search dimensions
         score = self.objective(model, self.X, self.y)
         return score
 
@@ -94,7 +97,7 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
             mean_dist = 0
         return -mean_dist # return negative mean dist, so minimizing gower distance has a positive effect
 
-    def prune_constraint_violations(self, adv_samples, X, y):
+    def prune_constraint_violations(self, adv_samples, X, y, get_prune_map=False):
         if isinstance(adv_samples, torch.Tensor):
             adv_samples = adv_samples.numpy(True)
         if isinstance(X,  torch.Tensor):
@@ -105,6 +108,12 @@ class HyperparamOptimizerWrapper(sk.base.BaseEstimator):
             selected_adv_samples = adv_samples[bool_sample_viability_map] #assumes shape nxm where n is number of samples and m is number of features per sample
             selected_x = X[bool_sample_viability_map] #assumes shape nxm where n is number of samples and m is number of features per sample
             selected_y = y[bool_sample_viability_map] # assumes y to be one dimensional 
-            return selected_adv_samples, selected_x, selected_y
+            if get_prune_map:
+                return selected_adv_samples, selected_x, selected_y, bool_sample_viability_map
+            else:
+                return selected_adv_samples, selected_x, selected_y
         else:
-            return adv_samples, X, y
+            if get_prune_map:
+                return adv_samples, X, y, np.array([True]*len(y))
+            else:
+                return adv_samples, X, y

@@ -16,6 +16,9 @@ from hyperparam_opt_wrapper import HyperparamOptimizerWrapper
 from hyperparameter_search_policies import AVAILABLE_OPT_STRATS
 from scorer import Scorer
 from hyperparameter_eval import wandb_log_scatter, evaluate_hyperparams
+from utils import log_dataset_metrics, sample_even, prune_labels
+from sklearn.preprocessing import StandardScaler
+import numpy as np
 
 DATASET_ALIASES = [
         "ctu_13_neris",
@@ -47,11 +50,18 @@ def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparame
     dataset = dataset_factory.get_dataset(dataset_name)
     x, y = dataset.get_x_y()
     if dataset_cap is not None and dataset_cap < x.shape[0]:
-        x = x[:dataset_cap]
-        y = y[:dataset_cap]
+        if DEFAULTS["sample_even"]:
+            x, y = sample_even(x,y,dataset_cap)
+        else:
+            x = x[:dataset_cap]
+            y = y[:dataset_cap]
 
     metadata = dataset.get_metadata(only_x=True)
+    print(metadata["feature"].tolist())
     distance_metric = Gower_dist(x=x, metadata=metadata) # TODO: may want to make this adjustable?
+    if log_style == Log_styles.BOTH or log_style == Log_styles.LOCAL:
+        log_dataset_metrics(distance_metric, results_path, x, y)
+    
     constraints = dataset.get_constraints()
 
     # TODO: Insert a crossval for victim training here
@@ -60,44 +70,53 @@ def pipeline(dataset_name, attacker_cls, victim_cls, opt_strat, eval_hyperparame
     result_dict = {}
     for fold_idx, (train_index, test_index) in enumerate(kfold_splitter.split(x,y)):
         # split used for victim training (and testing)
-        x_victim = x.to_numpy()[train_index] 
+        if not isinstance(x, np.ndarray):
+            x = x.to_numpy()
+        x_victim = x[train_index] 
         y_victim = y[train_index]
         #split used for adversarial training (and testing)
-        x_adv = x.to_numpy()[test_index]
+        x_adv = x[test_index]
         y_adv = y[test_index]
 
-        victim_scores, victim = victim_training_pipeline(x=x_victim, y=y_victim, x_test=x_adv, y_test=y_adv, victim_class=victim_cls, tune_model=tune_cls, log_style=log_style ,epochs=cls_epochs, cls_batch_size=cls_batch_size)
+        # scaling for the methods that are sensitive to feature scaling (should actually not impact gower distances. Only with min distance choices maybe)
+        scaler = StandardScaler()
+        scaler.fit(x_adv)
+        #x_adv = scaler.transform(x_adv)
+        #x_victim = scaler.transform(x_victim)
+
+        victim_scores, victim = victim_training_pipeline(x=x_victim, y=y_victim, x_test=x_adv, y_test=y_adv, victim_class=victim_cls, tune_model=tune_cls, log_style=log_style ,epochs=cls_epochs, cls_batch_size=cls_batch_size, scaler=scaler)
         if profile is not None:
             profile.dump_stats(DEFAULTS["results_path"]+DEFAULTS["performance_log_file"])
 
-        x_adv, y_adv = select_non_target_labels(x_adv,y_adv)
         adversarial_scores, adversarial = adversarial_training_pipeline(x_adv, y_adv, attacker_cls, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, check_constraints=check_constraints, results_path=results_path, log_style=log_style)
         if profile is not None:
             profile.dump_stats(DEFAULTS["results_path"]+DEFAULTS["performance_log_file"])
 
+        _, y_pruned = prune_labels(x_adv, y_adv, victim, get_prune_map=False)
+        
         result_dict[f"fold {fold_idx}"] = {
             "victim_scores": victim_scores,
             "victim": victim,
             "adversarial_scores": adversarial_scores,
             "adversarial": adversarial,
-            "adv_set_size": y_adv.shape[0]
+            "adv_set_size": y_pruned.shape[0]
         }
 
     return result_dict
         
 def adversarial_training_pipeline(x, y, adv_class, victim, constraints, metadata, distance_metric, opt_strat, eval_hyperparameters, check_constraints, results_path, log_style):
     search_dimensions = adv_class.SEARCH_DIMS()
-    optimization_wrapper = HyperparamOptimizerWrapper(adv_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, results_path=results_path, check_constraints=check_constraints) 
+    optimization_wrapper = HyperparamOptimizerWrapper(adv_class, search_dimensions, victim, constraints, metadata, distance_metric, opt_strat, log_style=log_style, results_path=results_path, check_constraints=check_constraints) 
     crossval_scorer = Scorer(name="outer_crossval_scorer", results_path=results_path, log_style=log_style  ,feature_names=metadata["feature"].tolist())
     scores = cross_validate(optimization_wrapper, x, y, scoring=crossval_scorer.score, error_score="raise", return_estimator=eval_hyperparameters, return_indices=eval_hyperparameters, cv=DEFAULTS["crossval_folds"])      
     if log_style == Log_styles.BOTH or log_style == Log_styles.WANDB:
         crossval_scorer.log_bar_chart()
         crossval_scorer.wandb_log_feat_analysis() 
     if log_style == Log_styles.BOTH or log_style == Log_styles.LOCAL:
-        crossval_scorer.dump_logs()
+        crossval_scorer.dump_logs(lastcall=True)
 
     if eval_hyperparameters:
-        hyperparam_results, hyperparam_resolver = evaluate_hyperparams(adv_class, victim, x, y, scores["estimator"], scores["indices"], constraints, metadata, check_constraints=check_constraints, distance_metric=distance_metric)
+        hyperparam_results, hyperparam_resolver = evaluate_hyperparams(adv_class, victim, x, y, scores["estimator"], scores["indices"], constraints, metadata, results_path, check_constraints=check_constraints, distance_metric=distance_metric)
         if log_style == Log_styles.BOTH or log_style == Log_styles.WANDB:
             wandb_log_scatter(hyperparam_results, hyperparam_resolver, scores["estimator"], fix_constraints_log=True)
         scores["hyperparam_results"] = hyperparam_results
@@ -105,8 +124,8 @@ def adversarial_training_pipeline(x, y, adv_class, victim, constraints, metadata
 
     return scores, optimization_wrapper # NOTE: unsure how corss_validate affects optimization wrapper so this may be weird with regards to things set in fit function. Better to use estimators returned in scores
 
-def victim_training_pipeline(x, y, x_test, y_test, victim_class, tune_model, log_style, epochs=DEFAULTS["victim_training_epochs"], cls_batch_size=-1): # tune model is generally False. If its ever true, we need to adjust this pipeline section
-    victim = victim_class(tune_model) # TODO: May want to pass an initialized object as parameter in some way, so we dont have to initialize here. Handeling class not nessecary since we dont do hyperparam optimization here
+def victim_training_pipeline(x, y, x_test, y_test, victim_class, tune_model, log_style, scaler, epochs=DEFAULTS["victim_training_epochs"], cls_batch_size=-1): # tune model is generally False. If its ever true, we need to adjust this pipeline section
+    victim = victim_class(tune_model, scaler) # TODO: May want to pass an initialized object as parameter in some way, so we dont have to initialize here. Handeling class not nessecary since we dont do hyperparam optimization here
     if cls_batch_size != -1:
         batches = batch(x,y,cls_batch_size)
     else:
@@ -149,12 +168,6 @@ def batch(x,y,num_batch):
     start_idx = num_batch*batch_size
     batches.append((x[start_idx:-1], y[start_idx:-1]))
     return batches
-
-def select_non_target_labels(x,y,target_label=DEFAULTS["target_label"]):
-    not_target_label_map = y != target_label
-    x = x[not_target_label_map]
-    y = y[not_target_label_map] #kinda redundant because this should now all be the same label, but whatever
-    return x, y
 
 def main(profile= None):
     parser = argparse.ArgumentParser()
@@ -211,7 +224,7 @@ def main(profile= None):
     if "config" in config.keys():
         log_config["file_loaded_config"] = config["config"]
 
-    if args.wandb_log:
+    if args.log_style == "wandb" or args.log_style == "both":
         wandb.init(
             project="tabular_adv",
             config=log_config

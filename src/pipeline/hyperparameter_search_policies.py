@@ -20,11 +20,11 @@ AVAILABLE_OPT_STRATS = {
 def grid_search(objective, search_dimensions, n_calls):
     pass
 
+#NOTE: does not return eval parameters, since this effectively means there is no hyperparameter search.
 def fixed_hyperparam(objective, default_params):
-    score = objective(default_params)
     hyperparameters = default_params
 
-    optresult = OptimizeResult({"x": hyperparameters, "fun": score, "x_iters": np.array([hyperparameters]), "func_vals": np.array([score])}) 
+    optresult = OptimizeResult({"x": hyperparameters, "fun": None, "x_iters": np.array([hyperparameters]), "func_vals": np.array([None])}) 
     return optresult
 
 def random_search(objective, search_dimensions, n_calls):

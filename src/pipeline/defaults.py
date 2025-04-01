@@ -1,7 +1,7 @@
 from enum import Enum
 
 DEFAULTS = {
-    "target_label": 1,
+    "target_label": 0,
     "ncalls": 50,
     "imperceptability_weight": 0.5,
     "tolerance": 0,
@@ -11,7 +11,10 @@ DEFAULTS = {
     "performance_log_file": "perf_log",
     "results_path": "./results",
     "check_constraints": False,
-    "crossval_folds": 3
+    "crossval_folds": 3,
+    "dataset_metric_subsampling_steps": 3,
+    "device": "cpu",
+    "sample_even": True
 }
 
 class Log_styles(Enum):

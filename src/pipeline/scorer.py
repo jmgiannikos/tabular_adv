@@ -4,6 +4,11 @@ import torch
 import wandb
 from hyperparam_opt_wrapper import HyperparamOptimizerWrapper
 from defaults import Log_styles
+from utils import prune_labels, find_unused_path
+from sklearn.metrics import confusion_matrix
+import os
+import json
+from adversarial_models import Adv_model
 
 # NOTE: this is kinda unclean, since we read a lot of dataset properties from the attacker wrapper, which is unintuitive. Should however be clean technically.
 class Scorer():
@@ -30,7 +35,7 @@ class Scorer():
         if self.local_log:
             self.results_path = results_path
 
-    def dump_logs(self):
+    def dump_logs(self, lastcall=False):
         if self.local_log:
             tensor_elements = []
             for element in self.feature_wise_distances: # NOTE: this may be redundant, but better safe than sorry (?)
@@ -43,15 +48,23 @@ class Scorer():
             feat_dist_tensor = torch.cat(tensor_elements, dim=0)
 
             scorer_id = hex(id(self))[2:].upper()
-            log_path = f"{self.results_path}[{scorer_id}]feat_dists.pt"
+            if lastcall:
+                os.remove(f"{self.results_path}[{scorer_id}]tmp_feat_dists.pt")
+                log_path = f"{self.results_path}[{scorer_id}]feat_dists.pt"
+                if os.path.exists(log_path):
+                    log_path = find_unused_path(log_path, iterator=1)
+            else:
+                log_path = f"{self.results_path}[{scorer_id}]tmp_feat_dists.pt"
 
-            with open(log_path, "w") as outfile:
-                torch.save(feat_dist_tensor, outfile)
+            torch.save(feat_dist_tensor, log_path)
         else:
             raise UserWarning("tried to dump scorer logs, when local logging was disabled")
 
     def score(self, attacker, X, y): #takes an initialized model and gives it a score. Must be compatible with sklearns crossvalidate
-        if self.feature_names is None:
+        full_x, full_y = X, y
+        X, y, label_pruning_map = prune_labels(X, y, attacker.victim, get_prune_map=True)
+        
+        if self.log_style != Log_styles.NOLOG and self.feature_names is None:
             self.feature_names = range(X.shape[1])
 
         adv_samples = attacker.attack(X)   
@@ -64,7 +77,7 @@ class Scorer():
                 self.feature_wise_distances.append(self.distance_metric.get_feature_wise_distances(X, adv_samples))
 
         if isinstance(attacker, HyperparamOptimizerWrapper):
-            pruned_adv_samples, pruned_X, pruned_y = attacker.prune_constraint_violations(adv_samples, X, y)
+            pruned_adv_samples, pruned_X, pruned_y, const_violation_prune_map = attacker.prune_constraint_violations(adv_samples, X, y, get_prune_map=True)
         elif self.constraints is not None:
             if isinstance(adv_samples, torch.Tensor):
                 adv_samples = adv_samples.numpy(True)
@@ -76,10 +89,12 @@ class Scorer():
             pruned_adv_samples = adv_samples[bool_sample_viability_map] #assumes shape nxm where n is number of samples and m is number of features per sample
             pruned_X = X[bool_sample_viability_map] #assumes shape nxm where n is number of samples and m is number of features per sample
             pruned_y = y[bool_sample_viability_map] # assumes y to be one dimensional 
+            const_violation_prune_map = bool_sample_viability_map
         else:
             pruned_adv_samples = adv_samples
             pruned_X = X
             pruned_y = y
+            const_violation_prune_map = np.array([True]*len(y)) 
         
         num_constraint_violations = np.shape(y)[0] - np.shape(pruned_y)[0] # value mostly irrellevant currently
         constraint_violation_ratio = num_constraint_violations / np.shape(y)[0]
@@ -107,11 +122,73 @@ class Scorer():
         if self.local_log:
             self.dump_logs() # regularly dump logs. Should overwrite old logs, when updating (all logs are also held locally)
 
+        pruning_map = self.merge_pruning_maps(label_pruning_map, const_violation_prune_map)
+        before_conf_mat, after_conf_mat = self.get_conf_mats(full_x, full_y, attacker.victim, pruned_adv_samples, pruning_map)
+        
+        if isinstance(attacker, Adv_model):
+            attacker_id = hex(id(attacker))[2:].upper()
+        else:
+            attacker_id = hex(id(attacker.attacker_model))[2:].upper() #should allow linking between adversarial logs and conf mats
+        self.log_conf_mats(before_conf_mat, after_conf_mat, attacker_id)
+
         self.call_counter += 1
         return {"constraint violations": num_constraint_violations,
                 "success rate": success_rate,
                 "imperceptability": imperceptability}
     
+    def merge_pruning_maps(self, label_map, constraint_map):
+        assert np.sum(label_map) == len(constraint_map) #pre execution sanity check
+        merged_map = []
+        constraint_map_idx = 0
+        for item in label_map:
+            if item:
+                merged_map.append(constraint_map[constraint_map_idx])
+                constraint_map_idx += 1
+            else:
+                merged_map.append(False)
+        merged_map = np.array(merged_map)
+        assert constraint_map_idx == len(constraint_map) #post execution sanity check
+        return merged_map
+
+    def log_conf_mats(self, before, after, attacker_id, iterator=0):
+        if self.local_log:
+            if iterator == 0:
+                file_path = f"{self.results_path}[{attacker_id}]confusion_matrices"
+            else:
+                file_path = f"{self.results_path}[{attacker_id}_{iterator}]confusion_matrices"
+
+            if os.path.exists(file_path):
+                iterator += 1
+                self.log_conf_mats(before, after, attacker_id, iterator)
+            else:
+                conf_mat_dict = {
+                    "before": before.tolist(),
+                    "after": after.tolist()
+                }
+
+                log_obj = json.dumps(conf_mat_dict)
+                with open(file_path, "w") as outfile:
+                    outfile.write(log_obj)
+
+
+
+    def get_conf_mats(self, x, y, victim, adv_samples, pruning_map):
+        # get before conf mat
+        victim_preds = victim.predict(x)
+        before_conf_mat = confusion_matrix(y, victim_preds)
+
+        # get after conf mat
+        pruned_samples_map = np.logical_not(pruning_map)
+        base_x = x[pruned_samples_map]
+        base_y = y[pruned_samples_map]
+        adv_y = y[pruning_map]
+        joint_x = np.append(base_x, adv_samples, axis=0)
+        joint_y = np.append(base_y, adv_y, axis=0)
+        attacked_victim_preds = victim.predict(joint_x)
+        after_conf_mat = confusion_matrix(joint_y, attacked_victim_preds)
+        return before_conf_mat, after_conf_mat
+
+
     def update_tables(self, chart_name, fold, value):
         fold_name = F"fold_{fold}"
         if chart_name in self.logged_tables.keys():

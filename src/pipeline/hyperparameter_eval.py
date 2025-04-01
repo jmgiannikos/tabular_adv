@@ -5,10 +5,11 @@ import wandb
 from hyperparam_opt_wrapper import HyperparamOptimizerWrapper
 from hyperparameter_search_policies import AVAILABLE_OPT_STRATS
 from scorer import Scorer
+from utils import prune_labels
 
 # NOTE: in current state doing this for trainable adv_cls is very costly, since we retrain the adv model from the ground. This is because we throw the previously trained models away!
 # TODO: make more efficient for trainable adv_cls. Will require touching up the entire pipeline
-def evaluate_hyperparams(adv_cls, victim, X, y, estimators, splits, constraints, metadata, results_path, check_constraints=True, distance_metric=None):
+def evaluate_hyperparams(adv_cls, victim, X, y, estimators, splits, constraints, metadata, results_path, check_constraints=True, distance_metric=None):    
     results = {}
     hyperparam_resolver = {}
 
@@ -20,6 +21,10 @@ def evaluate_hyperparams(adv_cls, victim, X, y, estimators, splits, constraints,
         y_train = y[splits["train"][fold_idx]]
         X_test = X[splits["test"][fold_idx]]
         y_test = y[splits["test"][fold_idx]]
+
+        X_train, y_train = prune_labels(X_train, y_train, victim) # local pruning so that this is handeled uniformly. Other methods also need full X and y
+        X_test, y_test = prune_labels(X_test, y_test, victim) 
+        
         estimator = estimators[fold_idx] #NOTE: this is the BEST estimator found by the hyperparameter search. If we want another parametrization we need to re-train 
 
         # extract results on train set from estimator and create hyperparam resolver
@@ -37,9 +42,9 @@ def evaluate_hyperparams(adv_cls, victim, X, y, estimators, splits, constraints,
 
             # evaluate on test set
             if check_constraints:
-                scorer_obj = Scorer(results_path=results_path, wandb_log=Log_styles.NOLOG, constraints=constraints, distance_metric=distance_metric)
+                scorer_obj = Scorer(results_path=results_path, log_style=Log_styles.NOLOG, constraints=constraints, distance_metric=distance_metric)
             else:
-                scorer_obj = Scorer(results_path=results_path, wandb_log=Log_styles.NOLOG, distance_metric=distance_metric)
+                scorer_obj = Scorer(results_path=results_path, log_style=Log_styles.NOLOG, distance_metric=distance_metric)
 
             hyperparam_result_test = scorer_obj.score(adv, X_test, y_test) # logging for these scores will be done manually
 
